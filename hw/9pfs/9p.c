@@ -1059,10 +1059,7 @@ static void coroutine_fn pdu_complete(V9fsPDU *pdu, ssize_t len)
 out_notify:
     pdu->s->transport->push_and_notify(pdu);
 
-    /* Now wakeup anybody waiting in flush for this request */
-    if (!qemu_co_queue_next(&pdu->complete)) {
-        pdu_free(pdu);
-    }
+    pdu_free(pdu);
 }
 
 static mode_t v9mode_to_mode(uint32_t mode, V9fsString *extension)
@@ -3999,7 +3996,7 @@ static inline bool is_read_only_op(V9fsPDU *pdu)
 
 void pdu_submit(V9fsPDU *pdu, P9MsgHeader *hdr)
 {
-    Coroutine *co;
+//    Coroutine *co;
     CoroutineEntry *handler;
     V9fsState *s = pdu->s;
 
@@ -4017,8 +4014,9 @@ void pdu_submit(V9fsPDU *pdu, P9MsgHeader *hdr)
     }
 
     qemu_co_queue_init(&pdu->complete);
-    co = qemu_coroutine_create(handler, pdu);
-    qemu_coroutine_enter(co);
+    handler(pdu);
+    //co = qemu_coroutine_create(handler, pdu);
+    //qemu_coroutine_enter(co);
 }
 
 /* Returns 0 on success, 1 on failure. */
