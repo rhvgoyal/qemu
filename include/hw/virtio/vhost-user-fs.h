@@ -47,6 +47,7 @@ typedef struct {
     uint16_t num_request_queues;
     uint16_t queue_size;
     uint64_t cache_size;
+    char *mdvtpath;
 } VHostUserFSConf;
 
 struct VHostUserFS {
@@ -61,6 +62,9 @@ struct VHostUserFS {
 
     /*< public >*/
     MemoryRegion cache;
+    /* Metadata version table */
+    size_t mdvt_size;
+    MemoryRegion mdvt;
 };
 
 /* Callbacks from the vhost-user code for slave commands */
