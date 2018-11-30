@@ -2168,7 +2168,7 @@ static void do_destroy(fuse_req_t req, fuse_ino_t nodeid,
 	se->got_destroy = 1;
 	se->got_init = 0;
 	if (se->op.destroy)
-		se->op.destroy(se->userdata);
+		se->op.destroy(se->userdata, se);
 
 	send_reply_ok(req, NULL, 0);
 }
@@ -2483,7 +2483,7 @@ void fuse_session_process_buf_int(struct fuse_session *se,
 			se->got_destroy = 1;
 			se->got_init = 0;
 			if (se->op.destroy)
-				se->op.destroy(se->userdata);
+				se->op.destroy(se->userdata, se);
 		} else {
 			goto reply_err;
 		}
@@ -2560,7 +2560,7 @@ void fuse_session_destroy(struct fuse_session *se)
 {
 	if (se->got_init && !se->got_destroy) {
 		if (se->op.destroy)
-			se->op.destroy(se->userdata);
+			se->op.destroy(se->userdata, se);
 	}
 	pthread_mutex_destroy(&se->lock);
 	free(se->cuse_data);
