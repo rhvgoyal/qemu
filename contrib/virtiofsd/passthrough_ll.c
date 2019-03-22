@@ -53,9 +53,11 @@
 #include <sys/xattr.h>
 #include <sys/capability.h>
 #include <sys/mount.h>
+#include <sys/resource.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 
+#include <glib.h>
 #include "passthrough_helpers.h"
 #include "seccomp.h"
 
@@ -2110,6 +2112,36 @@ static void setup_sandbox(struct lo_data *lo)
 	setup_seccomp();
 }
 
+/* Raise the maximum number of open file descriptors to the system limit */
+static void setup_nofile_rlimit(void)
+{
+	gchar *nr_open = NULL;
+	struct rlimit rlim;
+	long long max;
+
+	if (!g_file_get_contents("/proc/sys/fs/nr_open", &nr_open, NULL, NULL)) {
+		fuse_log(FUSE_LOG_ERR, "unable to read /proc/sys/fs/nr_open\n");
+		exit(1);
+	}
+
+	errno = 0;
+	max = strtoll(nr_open, NULL, 0);
+	if (errno) {
+		fuse_log(FUSE_LOG_ERR, "strtoll(%s): %m\n", nr_open);
+		exit(1);
+	}
+
+	rlim.rlim_cur = max;
+	rlim.rlim_max = max;
+
+	if (setrlimit(RLIMIT_NOFILE, &rlim) < 0) {
+		fuse_log(FUSE_LOG_ERR, "setrlimit(RLIMIT_NOFILE): %m\n");
+		exit(1);
+	}
+
+	g_free(nr_open);
+}
+
 int main(int argc, char *argv[])
 {
 	struct fuse_args args = FUSE_ARGS_INIT(argc, argv);
@@ -2124,6 +2156,8 @@ int main(int argc, char *argv[])
 
 	/* Don't mask creation mode, kernel already did that */
 	umask(0);
+
+	setup_nofile_rlimit();
 
 	pthread_mutex_init(&lo.mutex, NULL);
 	lo.root.next = lo.root.prev = &lo.root;
