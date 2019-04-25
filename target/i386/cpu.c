@@ -901,7 +901,7 @@ static FeatureWordInfo feature_word_info[FEATURE_WORDS] = {
             "kvmclock", "kvm-nopiodelay", "kvm-mmu", "kvmclock",
             "kvm-asyncpf", "kvm-steal-time", "kvm-pv-eoi", "kvm-pv-unhalt",
             NULL, "kvm-pv-tlb-flush", NULL, "kvm-pv-ipi",
-            NULL, NULL, NULL, NULL,
+            "kvm-asyncpf-error", NULL, NULL, NULL,
             NULL, NULL, NULL, NULL,
             NULL, NULL, NULL, NULL,
             "kvmclock-stable-bit", NULL, NULL, NULL,
@@ -2954,6 +2954,7 @@ static PropValue kvm_default_props[] = {
     { "acpi", "off" },
     { "monitor", "off" },
     { "svm", "off" },
+    { "kvm-asyncpf-error", "on" },
     { NULL, NULL },
 };
 
