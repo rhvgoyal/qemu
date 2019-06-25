@@ -1256,7 +1256,7 @@ void fuse_reply_none(fuse_req_t req);
  * @param e the entry parameters
  * @return zero for success, -errno for failure to send reply
  */
-int fuse_reply_entry(fuse_req_t req, const struct fuse_entry_param *e);
+int fuse_reply_entry(fuse_req_t req, const struct fuse_entry_param *e, bool shared);
 
 /**
  * Reply with a directory entry and open parameters
@@ -1276,7 +1276,7 @@ int fuse_reply_entry(fuse_req_t req, const struct fuse_entry_param *e);
  * @return zero for success, -errno for failure to send reply
  */
 int fuse_reply_create(fuse_req_t req, const struct fuse_entry_param *e,
-		      const struct fuse_file_info *fi);
+		      const struct fuse_file_info *fi, bool shared);
 
 /**
  * Reply with attributes
