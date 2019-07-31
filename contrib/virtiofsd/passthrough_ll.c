@@ -107,7 +107,19 @@ struct lo_inode {
 	int fd;
 	bool is_symlink;
 	struct lo_key key;
-	uint64_t refcount; /* protected by lo->mutex */
+
+	/* This counter keeps the inode alive during the FUSE session.
+	 * Incremented when the FUSE inode number is sent in a reply
+	 * (FUSE_LOOKUP, FUSE_READDIRPLUS, etc).  Decremented when an inode is
+	 * released by requests like FUSE_FORGET, FUSE_RMDIR, FUSE_RENAME, etc.
+	 *
+	 * Note that this value is untrusted because the client can manipulate
+	 * it arbitrarily using FUSE_FORGET requests.
+	 *
+	 * Protected by lo->mutex.
+	 */
+	uint64_t nlookup;
+
 	uint64_t version_offset;
 	uint64_t ireg_refid;
 	fuse_ino_t fuse_ino;
@@ -596,7 +608,7 @@ retry:
 	if (last == path) {
 		p = &lo->root;
 		pthread_mutex_lock(&lo->mutex);
-		p->refcount++;
+		p->nlookup++;
 		pthread_mutex_unlock(&lo->mutex);
 	} else {
 		*last = '\0';
@@ -801,8 +813,8 @@ static struct lo_inode *lo_find(struct lo_data *lo, struct stat *st)
 	pthread_mutex_lock(&lo->mutex);
 	p = g_hash_table_lookup(lo->inodes, &key);
 	if (p) {
-		assert(p->refcount > 0);
-		p->refcount++;
+		assert(p->nlookup > 0);
+		p->nlookup++;
 	}
 	pthread_mutex_unlock(&lo->mutex);
 
@@ -914,7 +926,7 @@ static int lo_do_lookup(fuse_req_t req, fuse_ino_t parent, const char *name,
 			goto out_err;
 
 		inode->is_symlink = S_ISLNK(e->attr.st_mode);
-		inode->refcount = 1;
+		inode->nlookup = 1;
 		inode->fd = newfd;
 		newfd = -1;
 		inode->key.ino = e->attr.st_ino;
@@ -1164,7 +1176,7 @@ static void lo_link(fuse_req_t req, fuse_ino_t ino, fuse_ino_t parent,
 		goto out_err;
 
 	pthread_mutex_lock(&lo->mutex);
-	inode->refcount++;
+	inode->nlookup++;
 	pthread_mutex_unlock(&lo->mutex);
 	e.ino = inode->fuse_ino;
 	update_version(lo, inode);
@@ -1313,9 +1325,9 @@ static void unref_inode_lolocked(struct lo_data *lo, struct lo_inode *inode, uin
 		return;
 
 	pthread_mutex_lock(&lo->mutex);
-	assert(inode->refcount >= n);
-	inode->refcount -= n;
-	if (!inode->refcount) {
+	assert(inode->nlookup >= n);
+	inode->nlookup -= n;
+	if (!inode->nlookup) {
 		lo_map_remove(&lo->ino_map, inode->fuse_ino);
                 g_hash_table_remove(lo->inodes, &inode->key);
 		if (g_hash_table_size(inode->posix_locks)) {
@@ -1338,7 +1350,7 @@ static int unref_all_inodes_cb(gpointer key, gpointer value,
 	struct lo_inode *inode  = value;
 	struct lo_data *lo = user_data;
 
-	inode->refcount = 0;
+	inode->nlookup = 0;
 	lo_map_remove(&lo->ino_map, inode->fuse_ino);
 	close(inode->fd);
 
@@ -1364,7 +1376,7 @@ static void lo_forget_one(fuse_req_t req, fuse_ino_t ino, uint64_t nlookup)
 
 	fuse_log(FUSE_LOG_DEBUG, "  forget %lli %lli -%lli\n",
 		(unsigned long long) ino,
-		(unsigned long long) inode->refcount,
+		(unsigned long long) inode->nlookup,
 		(unsigned long long) nlookup);
 
 	unref_inode_lolocked(lo, inode, nlookup);
@@ -2737,7 +2749,7 @@ static void setup_root(struct lo_data *lo, struct lo_inode *root)
 	root->fd = fd;
 	root->key.ino = stat.st_ino;
 	root->key.dev = stat.st_dev;
-	root->refcount = 2;
+	root->nlookup = 2;
 }
 
 static guint lo_key_hash(gconstpointer key)
