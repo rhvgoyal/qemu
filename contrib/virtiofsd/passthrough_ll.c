@@ -693,7 +693,7 @@ retry:
 	return 0;
 
 fail_unref:
-	unref_inode(lo, p, 1);
+	unref_inode_lolocked(lo, p, 1);
 fail:
 	if (retries) {
 		retries--;
@@ -730,7 +730,7 @@ fallback:
 	res = lo_parent_and_name(lo, inode, path, &parent);
 	if (res != -1) {
 		res = utimensat(parent->fd, path, tv, AT_SYMLINK_NOFOLLOW);
-		unref_inode(lo, parent, 1);
+		unref_inode_lolocked(lo, parent, 1);
 		lo_inode_put(lo, &parent);
 	}
 
@@ -1205,7 +1205,7 @@ fallback:
 	res = lo_parent_and_name(lo, inode, path, &parent);
 	if (res != -1) {
 		res = linkat(parent->fd, path, dfd, name, 0);
-		unref_inode(lo, parent, 1);
+		unref_inode_lolocked(lo, parent, 1);
 		lo_inode_put(lo, &parent);
 	}
 
@@ -1425,12 +1425,12 @@ static void lo_unlink(fuse_req_t req, fuse_ino_t parent, const char *name)
 	lo_inode_put(lo, &inode);
 }
 
-static void unref_inode_lolocked(struct lo_data *lo, struct lo_inode *inode, uint64_t n)
+/* To be called with lo->mutex held */
+static void unref_inode(struct lo_data *lo, struct lo_inode *inode, uint64_t n)
 {
 	if (!inode)
 		return;
 
-	pthread_mutex_lock(&lo->mutex);
 	assert(inode->nlookup >= n);
 	inode->nlookup -= n;
 	if (!inode->nlookup) {
@@ -1441,13 +1441,20 @@ static void unref_inode_lolocked(struct lo_data *lo, struct lo_inode *inode, uin
 		}
 		g_hash_table_destroy(inode->posix_locks);
 		pthread_mutex_destroy(&inode->plock_mutex);
-		pthread_mutex_unlock(&lo->mutex);
 
 		/* Drop our refcount from lo_do_lookup() */
 		lo_inode_put(lo, &inode);
-	} else {
-		pthread_mutex_unlock(&lo->mutex);
 	}
+}
+
+static void unref_inode_lolocked(struct lo_data *lo, struct lo_inode *inode, uint64_t n)
+{
+	if (!inode)
+		return;
+
+	pthread_mutex_lock(&lo->mutex);
+	unref_inode(lo, inode, n);
+	pthread_mutex_unlock(&lo->mutex);
 }
 
 static void lo_forget_one(fuse_req_t req, fuse_ino_t ino, uint64_t nlookup)
@@ -2509,12 +2516,7 @@ static void lo_destroy(void *userdata, struct fuse_session *se)
 		}
 	}
 
-	/* Normally lo->mutex must be taken when traversing lo->inodes but
-	 * lo_destroy() is a serialized request so no races are possible here.
-	 *
-	 * In addition, we cannot acquire lo->mutex since unref_inode() takes it
-	 * too and this would result in a recursive lock.
-	 */
+	pthread_mutex_lock(&lo->mutex);
 	while (true) {
 		GHashTableIter iter;
 		gpointer key, value;
@@ -2525,8 +2527,9 @@ static void lo_destroy(void *userdata, struct fuse_session *se)
 		}
 
 		struct lo_inode *inode = value;
-		unref_inode_lolocked(lo, inode, inode->nlookup);
+		unref_inode(lo, inode, inode->nlookup);
 	}
+	pthread_mutex_unlock(&lo->mutex);
 }
 
 
