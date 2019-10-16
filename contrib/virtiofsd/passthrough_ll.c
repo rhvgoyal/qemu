@@ -52,6 +52,8 @@
 #include <sys/syscall.h>
 #include <sys/xattr.h>
 #include <sys/mount.h>
+#include <sys/types.h>
+#include <sys/wait.h>
 
 #include "passthrough_helpers.h"
 
@@ -1835,6 +1837,63 @@ static void setup_net_namespace(void)
 	}
 }
 
+/*
+ * Move to a new pid namespace to prevent access to other processes if this
+ * process is compromised.
+ */
+static void setup_pid_namespace(void)
+{
+	pid_t child;
+
+	/*
+	 * Create a new pid namespace for *child* processes.  We'll have to
+	 * fork in order to enter the new pid namespace.  A new mount namespace
+	 * is also needed so that we can remount /proc for the new pid
+	 * namespace.
+	 */
+	if (unshare(CLONE_NEWPID | CLONE_NEWNS) != 0) {
+		fuse_log(FUSE_LOG_ERR, "unshare(CLONE_NEWPID | CLONE_NEWNS): %m\n");
+		exit(1);
+	}
+
+	child = fork();
+	if (child < 0) {
+		fuse_log(FUSE_LOG_ERR, "fork() failed: %m\n");
+		exit(1);
+	}
+	if (child > 0) {
+		pid_t waited;
+		int wstatus;
+
+		/* The parent waits for the child */
+		do {
+			waited = waitpid(child, &wstatus, 0);
+		} while (waited < 0 && errno == EINTR);
+
+		if (WIFEXITED(wstatus)) {
+			exit(WEXITSTATUS(wstatus));
+		}
+
+		exit(1);
+	}
+
+	/*
+	 * If the mounts have shared propagation then we want to opt out so our
+	 * mount changes don't affect the parent mount namespace.
+	 */
+	if (mount(NULL, "/", NULL, MS_REC|MS_SLAVE, NULL) < 0) {
+		fuse_log(FUSE_LOG_ERR, "mount(/, MS_REC|MS_SLAVE): %m\n");
+		exit(1);
+	}
+
+	/* The child must remount /proc to use the new pid namespace */
+	if (mount("proc", "/proc", "proc",
+		  MS_NODEV | MS_NOEXEC | MS_NOSUID | MS_RELATIME, NULL) < 0) {
+		fuse_log(FUSE_LOG_ERR, "mount(/proc): %m\n");
+		exit(1);
+	}
+}
+
 /* This magic is based on lxc's lxc_pivot_root() */
 static void setup_pivot_root(const char *source)
 {
@@ -1898,20 +1957,10 @@ static void setup_proc_self_fd(struct lo_data *lo)
 
 /*
  * Make the source directory our root so symlinks cannot escape and no other
- * files are accessible.
+ * files are accessible.  Assumes unshare(CLONE_NEWNS) was already called.
  */
 static void setup_mount_namespace(const char *source)
 {
-	if (unshare(CLONE_NEWNS) != 0) {
-		fuse_log(FUSE_LOG_ERR, "unshare(CLONE_NEWNS): %m\n");
-		exit(1);
-	}
-
-	if (mount(NULL, "/", NULL, MS_REC|MS_SLAVE, NULL) < 0) {
-		fuse_log(FUSE_LOG_ERR, "mount(/, MS_REC|MS_PRIVATE): %m\n");
-		exit(1);
-	}
-
 	if (mount(source, source, NULL, MS_BIND, NULL) < 0) {
 		fuse_log(FUSE_LOG_ERR, "mount(%s, %s, MS_BIND): %m\n", source, source);
 		exit(1);
@@ -1926,6 +1975,8 @@ static void setup_mount_namespace(const char *source)
  */
 static void setup_sandbox(struct lo_data *lo)
 {
+	setup_pid_namespace();
+	setup_proc_self_fd(lo);
 	setup_net_namespace();
 	setup_mount_namespace(lo->source);
 }
@@ -2045,9 +2096,6 @@ int main(int argc, char *argv[])
 	    goto err_out3;
 
 	fuse_daemonize(opts.foreground);
-
-	/* Must be after daemonize to get the right /proc/self/fd */
-	setup_proc_self_fd(&lo);
 
 	setup_sandbox(&lo);
 
