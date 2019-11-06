@@ -2121,10 +2121,16 @@ static void setup_nofile_rlimit(void)
 }
 
 static void log_func(enum fuse_log_level level,
-		     const char *fmt, va_list ap)
+		     const char *_fmt, va_list ap)
 {
+	char *fmt = (char *)_fmt;
+
 	if (current_log_level < level)
 		return;
+
+	if (current_log_level == FUSE_LOG_DEBUG)
+		fmt = g_strdup_printf("[ID: %08ld] %s",
+				syscall(__NR_gettid), _fmt);
 
 	if (use_syslog) {
 		int priority = LOG_ERR;
@@ -2142,6 +2148,9 @@ static void log_func(enum fuse_log_level level,
 	} else {
 		vfprintf(stderr, fmt, ap);
 	}
+
+	if (current_log_level == FUSE_LOG_DEBUG)
+		g_free(fmt);
 }
 
 int main(int argc, char *argv[])
