@@ -109,7 +109,8 @@ static uint64_t fv_get_features(VuDev *dev)
     uint64_t features;
 
     features = 1ull << VIRTIO_F_VERSION_1 |
-               1ull << VIRTIO_FS_F_NOTIFICATION;
+               1ull << VIRTIO_FS_F_NOTIFICATION |
+               1ull << VHOST_USER_F_PROTOCOL_FEATURES;
 
     return features;
 }
@@ -927,6 +928,27 @@ static bool fv_queue_order(VuDev *dev, int qidx)
     return false;
 }
 
+static uint64_t fv_get_protocol_features(VuDev *dev)
+{
+	return 1ull << VHOST_USER_PROTOCOL_F_CONFIG;
+}
+
+static int fv_get_config(VuDev *dev, uint8_t *config, uint32_t len)
+{
+	struct virtio_fs_config fscfg = {};
+
+	fuse_log(FUSE_LOG_DEBUG, "%s:Setting notify_buf_size=%d\n", __func__,
+                 sizeof(struct fuse_notify_lock_out));
+	/*
+	 * As of now only notification related to lock is supported. As more
+	 * notification types are supported, bump up the size accordingly.
+	 */
+	fscfg.notify_buf_size = sizeof(struct fuse_notify_lock_out);
+
+	memcpy(config, &fscfg, len);
+	return 0;
+}
+
 static const VuDevIface fv_iface = {
     .get_features = fv_get_features,
     .set_features = fv_set_features,
@@ -935,6 +957,8 @@ static const VuDevIface fv_iface = {
     .queue_set_started = fv_queue_set_started,
 
     .queue_is_processed_in_order = fv_queue_order,
+    .get_protocol_features = fv_get_protocol_features,
+    .get_config = fv_get_config,
 };
 
 /*
