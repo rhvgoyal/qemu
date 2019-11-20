@@ -48,22 +48,27 @@
 #include <inttypes.h>
 #include <limits.h>
 #include <pthread.h>
+#include <semaphore.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/file.h>
+#include <sys/mman.h>
 #include <sys/mount.h>
 #include <sys/prctl.h>
 #include <sys/resource.h>
+#include <sys/socket.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
+#include <sys/un.h>
 #include <sys/wait.h>
 #include <sys/xattr.h>
 #include <syslog.h>
 #include <unistd.h>
 
+#include "ireg.h"
 #include "passthrough_helpers.h"
 #include "seccomp.h"
 
@@ -119,6 +124,8 @@ struct lo_inode {
      */
     uint64_t nlookup;
 
+    uint64_t version_offset;
+    uint64_t ireg_refid;
     fuse_ino_t fuse_ino;
     pthread_mutex_t plock_mutex;
     GHashTable *posix_locks; /* protected by lo_inode->plock_mutex */
@@ -147,9 +154,13 @@ struct lo_data {
     char *source;
     double timeout;
     int cache;
+    int shared;
     int timeout_set;
     int readdirplus_set;
     int readdirplus_clear;
+    int ireg_sock;
+    int64_t *version_table;
+    uint64_t version_table_size;
     struct lo_inode root;
     GHashTable *inodes; /* protected by lo->mutex */
     struct lo_map ino_map; /* protected by lo->mutex */
@@ -175,6 +186,8 @@ static const struct fuse_opt lo_opts[] = {
     { "cache=none", offsetof(struct lo_data, cache), CACHE_NONE },
     { "cache=auto", offsetof(struct lo_data, cache), CACHE_AUTO },
     { "cache=always", offsetof(struct lo_data, cache), CACHE_ALWAYS },
+    { "shared", offsetof(struct lo_data, shared), 1 },
+    { "no_shared", offsetof(struct lo_data, shared), 0 },
     { "readdirplus", offsetof(struct lo_data, readdirplus_set), 1 },
     { "no_readdirplus", offsetof(struct lo_data, readdirplus_clear), 1 },
     FUSE_OPT_END
@@ -183,6 +196,7 @@ static bool use_syslog = false;
 static int current_log_level;
 static void unref_inode_lolocked(struct lo_data *lo, struct lo_inode *inode,
                                  uint64_t n);
+static void put_shared(struct lo_data *lo, struct lo_inode *inode);
 
 static struct {
     pthread_mutex_t mutex;
@@ -490,6 +504,7 @@ static void lo_inode_put(struct lo_data *lo, struct lo_inode **inodep)
 
     if (g_atomic_int_dec_and_test(&inode->refcount)) {
         close(inode->fd);
+        put_shared(lo, inode);
         free(inode);
     }
 }
@@ -565,11 +580,35 @@ static void lo_init(void *userdata, struct fuse_conn_info *conn)
         }
     }
 
+    /* TODO: shared version support for readdirplus */
     if ((lo->cache == CACHE_NONE && !lo->readdirplus_set) ||
-        lo->readdirplus_clear) {
+        lo->readdirplus_clear || lo->shared) {
         fuse_log(FUSE_LOG_DEBUG, "lo_init: disabling readdirplus\n");
         conn->want &= ~FUSE_CAP_READDIRPLUS;
     }
+}
+
+static int64_t *version_ptr(struct lo_data *lo, struct lo_inode *inode)
+{
+    return lo->version_table + inode->version_offset;
+}
+
+static int64_t get_version(struct lo_data *lo, struct lo_inode *inode)
+{
+    if (!inode->version_offset) {
+        return 0;
+    }
+
+    return __atomic_load_8(version_ptr(lo, inode), __ATOMIC_SEQ_CST);
+}
+
+static void update_version(struct lo_data *lo, struct lo_inode *inode)
+{
+    if (!inode->version_offset) {
+        return;
+    }
+
+    __atomic_add_fetch(version_ptr(lo, inode), 1, __ATOMIC_SEQ_CST);
 }
 
 static void lo_getattr(fuse_req_t req, fuse_ino_t ino,
@@ -703,6 +742,7 @@ static void lo_setattr(fuse_req_t req, fuse_ino_t ino, struct stat *attr,
             goto out_err;
         }
     }
+    update_version(lo, inode);
     lo_inode_put(lo, &inode);
 
     return lo_getattr(req, ino, fi);
@@ -731,6 +771,74 @@ static struct lo_inode *lo_find(struct lo_data *lo, struct stat *st)
     pthread_mutex_unlock(&lo->mutex);
 
     return p;
+}
+
+struct msgreply {
+    struct lo_inode *inode;
+    sem_t ready;
+};
+
+static void get_shared(struct lo_data *lo, struct lo_inode *inode)
+{
+    int res;
+    struct msgreply rep = {
+        .inode = inode,
+    };
+    struct ireg_msg msg = {
+        .op = IREG_GET,
+        .handle = (uintptr_t) &rep,
+        .get = {
+                .ino = inode->key.ino,
+                .dev = inode->key.dev,
+            },
+    };
+
+    if (lo->ireg_sock == -1) {
+        inode->version_offset = 0;
+        return;
+    }
+
+    sem_init(&rep.ready, 0, 0);
+
+    res = write(lo->ireg_sock, &msg, sizeof(msg));
+    if (res != sizeof(msg)) {
+        if (res == -1) {
+            fuse_log(FUSE_LOG_WARNING,
+                     "write(lo->ireg_sock, {IREG_GET, ...}): %m\n");
+        } else {
+            fuse_log(FUSE_LOG_WARNING, "short write to ireg_sock: %i\n", res);
+        }
+        return;
+    }
+
+    while (sem_wait(&rep.ready)) {
+        ;
+    }
+    sem_destroy(&rep.ready);
+}
+
+static void put_shared(struct lo_data *lo, struct lo_inode *inode)
+{
+    int res;
+    struct ireg_msg msg = {
+        .op = IREG_PUT,
+        .put.refid = inode->ireg_refid,
+    };
+
+    if (lo->ireg_sock == -1) {
+        return;
+    }
+
+    res = write(lo->ireg_sock, &msg, sizeof(msg));
+    if (res != sizeof(msg)) {
+        if (res == -1) {
+            fuse_log(FUSE_LOG_WARNING,
+                     "write(lo->ireg_sock, {IREG_PUT, ...}): %m\n");
+        } else {
+            fuse_log(FUSE_LOG_WARNING, "short write to ireg_sock: %i\n", res);
+        }
+        return;
+    }
 }
 
 /* value_destroy_func for posix_locks GHashTable */
@@ -814,17 +922,32 @@ static int lo_do_lookup(fuse_req_t req, fuse_ino_t parent, const char *name,
         inode->posix_locks = g_hash_table_new_full(
             g_direct_hash, g_direct_equal, NULL, posix_locks_value_destroy);
 
+        get_shared(lo, inode);
+
         pthread_mutex_lock(&lo->mutex);
         inode->fuse_ino = lo_add_inode_mapping(req, inode);
         g_hash_table_insert(lo->inodes, &inode->key, inode);
         pthread_mutex_unlock(&lo->mutex);
     }
+
+    e->initial_version = get_version(lo, inode);
+    res = fstatat(inode->fd, "", &e->attr, AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW);
+    if (res == -1) {
+        saverr = errno;
+        unref_inode_lolocked(lo, inode, 1);
+        errno = saverr;
+        goto out_err;
+    }
+
     e->ino = inode->fuse_ino;
+    e->version_offset = inode->version_offset;
     lo_inode_put(lo, &inode);
     lo_inode_put(lo, &dir);
 
-    fuse_log(FUSE_LOG_DEBUG, "  %lli/%s -> %lli\n", (unsigned long long)parent,
-             name, (unsigned long long)e->ino);
+    fuse_log(FUSE_LOG_DEBUG, "  %lli/%s -> %lli (version_table[%lli]=%lli)\n",
+             (unsigned long long)parent, name, (unsigned long long)e->ino,
+             (unsigned long long)e->version_offset,
+             (unsigned long long)e->initial_version);
 
     return 0;
 
@@ -859,7 +982,7 @@ static void lo_lookup(fuse_req_t req, fuse_ino_t parent, const char *name)
     if (err) {
         fuse_reply_err(req, err);
     } else {
-        fuse_reply_entry(req, &e);
+        fuse_reply_entry(req, &e, lo_data(req)->shared);
     }
 }
 
@@ -963,6 +1086,8 @@ static void lo_mknod_symlink(fuse_req_t req, fuse_ino_t parent,
         goto out;
     }
 
+    update_version(lo, dir);
+
     saverr = lo_do_lookup(req, parent, name, &e);
     if (saverr) {
         goto out;
@@ -971,7 +1096,7 @@ static void lo_mknod_symlink(fuse_req_t req, fuse_ino_t parent,
     fuse_log(FUSE_LOG_DEBUG, "  %lli/%s -> %lli\n", (unsigned long long)parent,
              name, (unsigned long long)e.ino);
 
-    fuse_reply_entry(req, &e);
+    fuse_reply_entry(req, &e, lo->shared);
     lo_inode_put(lo, &dir);
     return;
 
@@ -1041,11 +1166,13 @@ static void lo_link(fuse_req_t req, fuse_ino_t ino, fuse_ino_t parent,
     inode->nlookup++;
     pthread_mutex_unlock(&lo->mutex);
     e.ino = inode->fuse_ino;
+    update_version(lo, inode);
+    update_version(lo, parent_inode);
 
     fuse_log(FUSE_LOG_DEBUG, "  %lli/%s -> %lli\n", (unsigned long long)parent,
              name, (unsigned long long)e.ino);
 
-    fuse_reply_entry(req, &e);
+    fuse_reply_entry(req, &e, lo->shared);
     lo_inode_put(lo, &parent_inode);
     lo_inode_put(lo, &inode);
     return;
@@ -1091,8 +1218,21 @@ static void lo_rmdir(fuse_req_t req, fuse_ino_t parent, const char *name)
     }
 
     res = unlinkat(lo_fd(req, parent), name, AT_REMOVEDIR);
+    if (res == -1) {
+        fuse_reply_err(req, errno);
+    } else {
+        struct lo_inode *parent_inode;
 
-    fuse_reply_err(req, res == -1 ? errno : 0);
+        update_version(lo, inode);
+
+        parent_inode = lo_inode(req, parent);
+        if (parent_inode) {
+            update_version(lo, parent_inode);
+            lo_inode_put(lo, &parent_inode);
+        }
+
+        fuse_reply_err(req, 0);
+    }
     unref_inode_lolocked(lo, inode, 1);
     lo_inode_put(lo, &inode);
 }
@@ -1144,8 +1284,18 @@ static void lo_rename(fuse_req_t req, fuse_ino_t parent, const char *name,
     }
 
     res = renameat(parent_inode->fd, name, newparent_inode->fd, newname);
+    if (res == -1) {
+        fuse_reply_err(req, errno);
+    } else {
+        update_version(lo, oldinode);
+        if (newinode) {
+            update_version(lo, newinode);
+        }
+        update_version(lo, parent_inode);
+        update_version(lo, newparent_inode);
+        fuse_reply_err(req, 0);
+    }
 
-    fuse_reply_err(req, res == -1 ? errno : 0);
 out:
     unref_inode_lolocked(lo, oldinode, 1);
     unref_inode_lolocked(lo, newinode, 1);
@@ -1173,8 +1323,21 @@ static void lo_unlink(fuse_req_t req, fuse_ino_t parent, const char *name)
     }
 
     res = unlinkat(lo_fd(req, parent), name, 0);
+    if (res == -1) {
+        fuse_reply_err(req, errno);
+    } else {
+        struct lo_inode *parent_inode;
 
-    fuse_reply_err(req, res == -1 ? errno : 0);
+        update_version(lo, inode);
+
+        parent_inode = lo_inode(req, parent);
+        if (parent_inode) {
+            update_version(lo, parent_inode);
+            lo_inode_put(lo, &parent_inode);
+        }
+
+        fuse_reply_err(req, 0);
+    }
     unref_inode_lolocked(lo, inode, 1);
     lo_inode_put(lo, &inode);
 }
@@ -1584,6 +1747,8 @@ static void lo_create(fuse_req_t req, fuse_ino_t parent, const char *name,
     if (!err) {
         ssize_t fh;
 
+        update_version(lo, parent_inode);
+
         pthread_mutex_lock(&lo->mutex);
         fh = lo_add_fd_mapping(req, fd);
         pthread_mutex_unlock(&lo->mutex);
@@ -1608,7 +1773,7 @@ out:
     if (err) {
         fuse_reply_err(req, err);
     } else {
-        fuse_reply_create(req, &e, fi);
+        fuse_reply_create(req, &e, fi, lo->shared);
     }
 }
 
@@ -1916,6 +2081,7 @@ static void lo_write_buf(fuse_req_t req, fuse_ino_t ino,
     (void)ino;
     ssize_t res;
     struct fuse_bufvec out_buf = FUSE_BUFVEC_INIT(fuse_buf_size(in_buf));
+    struct lo_data *lo = lo_data(req);
     bool cap_fsetid_dropped = false;
 
     out_buf.buf[0].flags = FUSE_BUF_IS_FD | FUSE_BUF_FD_SEEK;
@@ -1942,6 +2108,14 @@ static void lo_write_buf(fuse_req_t req, fuse_ino_t ino,
     if (res < 0) {
         fuse_reply_err(req, -res);
     } else {
+        struct lo_inode *inode;
+
+        inode = lo_inode(req, ino);
+        if (inode) {
+            update_version(lo, inode);
+            lo_inode_put(lo, &inode);
+        }
+
         fuse_reply_write(req, (size_t)res);
     }
 
@@ -1970,6 +2144,7 @@ static void lo_fallocate(fuse_req_t req, fuse_ino_t ino, int mode, off_t offset,
                          off_t length, struct fuse_file_info *fi)
 {
     int err = EOPNOTSUPP;
+    struct lo_data *lo = lo_data(req);
     (void)ino;
 
 #ifdef CONFIG_FALLOCATE
@@ -1986,6 +2161,16 @@ static void lo_fallocate(fuse_req_t req, fuse_ino_t ino, int mode, off_t offset,
 
     err = posix_fallocate(lo_fi_fd(req, fi), offset, length);
 #endif
+
+    if (!err) {
+        struct lo_inode *inode;
+
+        inode = lo_inode(req, ino);
+        if (inode) {
+            update_version(lo, inode);
+            lo_inode_put(lo, &inode);
+        }
+    }
 
     fuse_reply_err(req, err);
 }
@@ -2197,6 +2382,9 @@ static void lo_setxattr(fuse_req_t req, fuse_ino_t ino, const char *name,
 
     saverr = ret == -1 ? errno : 0;
 
+    if (!saverr) {
+        update_version(lo, inode);
+    }
 out:
     if (fd >= 0) {
         close(fd);
@@ -2246,6 +2434,9 @@ static void lo_removexattr(fuse_req_t req, fuse_ino_t ino, const char *name)
 
     saverr = ret == -1 ? errno : 0;
 
+    if (!saverr) {
+        update_version(lo, inode);
+    }
 out:
     if (fd >= 0) {
         close(fd);
@@ -2793,6 +2984,101 @@ static void log_func(enum fuse_log_level level, const char *fmt, va_list ap)
     }
 }
 
+static void *ireg_do(void *data)
+{
+    struct lo_data *lo = data;
+    int res;
+    char buf[100];
+    struct srv_msg reply;
+    struct msgreply *rep;
+
+    for (;;) {
+        res = read(lo->ireg_sock, buf, sizeof(buf));
+        if (res <= 0) {
+            if (res == -1) {
+                fuse_log(FUSE_LOG_WARNING, "read(lo->ireg_sock, ...): %m\n");
+            } else {
+                fuse_log(FUSE_LOG_WARNING, "disconnected from ireg\n");
+            }
+            return NULL;
+        }
+        if (res != sizeof(reply)) {
+            fuse_log(FUSE_LOG_WARNING, "bad size message: %i\n", res);
+            continue;
+        }
+
+        memcpy(&reply, buf, sizeof(reply));
+        if (reply.op != SRV_VERSION) {
+            fuse_log(FUSE_LOG_WARNING, "bad reply to IREG_GET: %i\n", reply.op);
+            continue;
+        }
+
+        rep = (struct msgreply *)(uintptr_t)reply.handle;
+        rep->inode->version_offset = reply.version.offset;
+        rep->inode->ireg_refid = reply.version.refid;
+        sem_post(&rep->ready);
+    }
+}
+
+static void setup_shared_versions(struct lo_data *lo)
+{
+    int fd, sock, res;
+    const char *version_path = "/dev/shm/fuse_shared_versions";
+    struct stat stat;
+    struct sockaddr_un name = { .sun_family = AF_UNIX };
+    const char *socket_name = "/tmp/ireg.sock";
+    void *addr;
+
+    lo->ireg_sock = -1;
+    if (!lo->shared) {
+        return;
+    }
+
+    sock = socket(AF_UNIX, SOCK_SEQPACKET, 0);
+    if (sock == -1) {
+        fuse_log(FUSE_LOG_ERR, "socket(AF_UNIX, SOCK_SEQPACKET, 0): %m\n");
+        exit(1);
+    }
+
+    strncpy(name.sun_path, socket_name, sizeof(name.sun_path) - 1);
+
+    res = connect(sock, (const struct sockaddr *)&name,
+                  sizeof(struct sockaddr_un));
+    if (res == -1) {
+        fuse_log(FUSE_LOG_WARNING, "connect to ireg: %m\n");
+        close(sock);
+        lo->ireg_sock = -1;
+        return;
+    }
+
+    lo->ireg_sock = sock;
+
+    fd = open(version_path, O_RDWR);
+    if (sock == -1) {
+        fuse_log(FUSE_LOG_ERR, "open(%s, O_RDWR): %m\n", version_path);
+        exit(1);
+    }
+
+    res = fstat(fd, &stat);
+    if (res == -1) {
+        fuse_log(FUSE_LOG_ERR, "fstat(%i, &stat): %m\n", fd);
+        exit(1);
+    }
+
+    lo->version_table_size = stat.st_size / sizeof(lo->version_table[0]);
+
+    addr = mmap(NULL, stat.st_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (addr == MAP_FAILED) {
+        fuse_log(
+            FUSE_LOG_ERR,
+            "mmap(NULL, %li, PROT_READ | PROT_WRITE, MAP_SHARED, %i, 0): %m\n",
+            stat.st_size, fd);
+        exit(1);
+    }
+
+    lo->version_table = addr;
+}
+
 static void setup_root(struct lo_data *lo, struct lo_inode *root)
 {
     int fd, res;
@@ -2966,6 +3252,7 @@ int main(int argc, char *argv[])
         exit(1);
     }
 
+    setup_shared_versions(&lo);
     se = fuse_session_new(&args, &lo_oper, sizeof(lo_oper), &lo);
     if (se == NULL) {
         goto err_out1;
@@ -2989,9 +3276,24 @@ int main(int argc, char *argv[])
     setup_sandbox(&lo, se, opts.syslog);
 
     setup_root(&lo, &lo.root);
+
+    if (lo.ireg_sock != -1) {
+        pthread_t ireg_thread;
+
+        ret = pthread_create(&ireg_thread, NULL, ireg_do, &lo);
+        if (ret) {
+            fuse_log(FUSE_LOG_WARNING, "pthread_create: %s\n", strerror(ret));
+            ret = 1;
+            goto err_out4;
+        }
+
+        get_shared(&lo, &lo.root);
+    }
+
     /* Block until ctrl+c or fusermount -u */
     ret = virtio_loop(se);
 
+err_out4:
     fuse_session_unmount(se);
     cleanup_capng();
 err_out3:

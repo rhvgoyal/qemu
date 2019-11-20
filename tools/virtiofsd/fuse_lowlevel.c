@@ -397,28 +397,46 @@ static void fill_open(struct fuse_open_out *arg, const struct fuse_file_info *f)
     }
 }
 
-int fuse_reply_entry(fuse_req_t req, const struct fuse_entry_param *e)
+int fuse_reply_entry(fuse_req_t req, const struct fuse_entry_param *e,
+                     bool shared)
 {
-    struct fuse_entry_out arg;
-    size_t size = sizeof(arg);
+    char buf[sizeof(struct fuse_entry_out) + sizeof(struct fuse_entryver_out)];
+    struct fuse_entry_out *earg = (struct fuse_entry_out *)buf;
+    struct fuse_entryver_out *ever =
+        (struct fuse_entryver_out *)(buf + sizeof(struct fuse_entry_out));
+    size_t size = sizeof(buf);
 
-    memset(&arg, 0, sizeof(arg));
-    fill_entry(&arg, e);
-    return send_reply_ok(req, &arg, size);
+    if ((req->se->conn.proto_minor >= 9) && !shared) {
+        size -= sizeof(struct fuse_entryver_out);
+    }
+
+    memset(buf, 0, sizeof(buf));
+    fill_entry(earg, e);
+    ever->initial_version = e->initial_version;
+    ever->version_index = e->version_offset;
+    return send_reply_ok(req, buf, size);
 }
 
 int fuse_reply_create(fuse_req_t req, const struct fuse_entry_param *e,
-                      const struct fuse_file_info *f)
+                      const struct fuse_file_info *f, bool shared)
 {
-    char buf[sizeof(struct fuse_entry_out) + sizeof(struct fuse_open_out)];
+    char buf[sizeof(struct fuse_entry_out) + sizeof(struct fuse_open_out) +
+             sizeof(struct fuse_entryver_out)];
     size_t entrysize = sizeof(struct fuse_entry_out);
     struct fuse_entry_out *earg = (struct fuse_entry_out *)buf;
     struct fuse_open_out *oarg = (struct fuse_open_out *)(buf + entrysize);
+    struct fuse_entryver_out *ever =
+        (struct fuse_entryver_out *)(buf + entrysize +
+                                     sizeof(struct fuse_open_out));
 
     memset(buf, 0, sizeof(buf));
     fill_entry(earg, e);
     fill_open(oarg, f);
-    return send_reply_ok(req, buf, entrysize + sizeof(struct fuse_open_out));
+    ever->initial_version = e->initial_version;
+    ever->version_index = e->version_offset;
+    return send_reply_ok(req, buf,
+                         entrysize + sizeof(struct fuse_open_out) +
+                             (shared ? sizeof(struct fuse_entryver_out) : 0));
 }
 
 int fuse_reply_attr(fuse_req_t req, const struct stat *attr,
