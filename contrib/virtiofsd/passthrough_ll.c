@@ -1926,18 +1926,16 @@ static void lo_setlk(fuse_req_t req, fuse_ino_t ino,
 	struct lo_data *lo = lo_data(req);
 	struct lo_inode *inode;
 	struct lo_inode_plock *plock;
-	int ret, saverr = 0;
+	int ret, saverr = 0, ofd;
+	uint64_t unique;
+	struct fuse_session *se = req->se;
+	bool async_lock = false;
 
 	fuse_log(FUSE_LOG_DEBUG, "lo_setlk(ino=%" PRIu64 ", flags=%d)"
 		 " cmd=%d pid=%d owner=0x%lx sleep=%d l_whence=%d"
 	         " l_start=0x%lx l_len=0x%lx\n", ino, fi->flags,
 		 lock->l_type, lock->l_pid, fi->lock_owner, sleep,
 		 lock->l_whence, lock->l_start, lock->l_len);
-
-	if (sleep) {
-		fuse_reply_err(req, EOPNOTSUPP);
-		return;
-	}
 
 	inode = lo_inode(req, ino);
 	if (!inode) {
@@ -1951,21 +1949,54 @@ static void lo_setlk(fuse_req_t req, fuse_ino_t ino,
 
 	if (!plock) {
 		saverr = ret;
+		pthread_mutex_unlock(&inode->plock_mutex);
 		goto out;
 	}
 
+	/*
+	 * plock is now released when inode is going away. We already have
+	 * a reference on inode, so it is guaranteed that plock->fd is
+	 * still around even after dropping inode->plock_mutex lock
+	 */
+	ofd = plock->fd;
+	pthread_mutex_unlock(&inode->plock_mutex);
+
+	/*
+	 * If this lock request can block, request caller to wait for
+	 * notification. Do not access req after this. Once lock is
+	 * available, send a notification instead.
+	 */
+	if (sleep && lock->l_type != F_UNLCK) {
+		/*
+		 * If notification queue is not enabled, can't support async
+		 * locks.
+		 */
+		if (!se->notify_enabled) {
+			saverr = EOPNOTSUPP;
+			goto out;
+		}
+		async_lock = true;
+		unique = req->unique;
+		fuse_reply_wait(req);
+	}
 	/* TODO: Is it alright to modify flock? */
 	lock->l_pid = 0;
-	ret = fcntl(plock->fd, F_OFD_SETLK, lock);
+	if (async_lock)
+		ret = fcntl(ofd, F_OFD_SETLKW, lock);
+	else
+		ret = fcntl(ofd, F_OFD_SETLK, lock);
 	if (ret == -1) {
 		saverr = errno;
 	}
 
 out:
-	pthread_mutex_unlock(&inode->plock_mutex);
 	lo_inode_put(lo, &inode);
 
-	fuse_reply_err(req, saverr);
+	if (!async_lock)
+		fuse_reply_err(req, saverr);
+	else {
+		fuse_lowlevel_notify_lock(se, unique, saverr);
+	}
 }
 
 static void lo_fsyncdir(fuse_req_t req, fuse_ino_t ino, int datasync,
