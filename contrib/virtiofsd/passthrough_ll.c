@@ -936,6 +936,14 @@ static void put_shared(struct lo_data *lo, struct lo_inode *inode)
 	}
 }
 
+static void posix_locks_value_destroy(gpointer data)
+{
+	struct lo_inode_plock *plock = data;
+
+	close(plock->fd);
+	free(plock);
+}
+
 /* Increments nlookup and caller must release refcount using
  * lo_inode_put(&parent).
  */
@@ -994,7 +1002,9 @@ static int lo_do_lookup(fuse_req_t req, fuse_ino_t parent, const char *name,
 		inode->key.ino = e->attr.st_ino;
 		inode->key.dev = e->attr.st_dev;
 		pthread_mutex_init(&inode->plock_mutex, NULL);
-		inode->posix_locks = g_hash_table_new(g_direct_hash, g_direct_equal);
+		inode->posix_locks = g_hash_table_new_full(g_direct_hash,
+					g_direct_equal, NULL,
+					posix_locks_value_destroy);
 
 		get_shared(lo, inode);
 
@@ -1436,9 +1446,6 @@ static void unref_inode(struct lo_data *lo, struct lo_inode *inode, uint64_t n)
 	if (!inode->nlookup) {
 		lo_map_remove(&lo->ino_map, inode->fuse_ino);
                 g_hash_table_remove(lo->inodes, &inode->key);
-		if (g_hash_table_size(inode->posix_locks)) {
-			fuse_log(FUSE_LOG_WARNING, "Hash table is not empty\n");
-		}
 		g_hash_table_destroy(inode->posix_locks);
 		pthread_mutex_destroy(&inode->plock_mutex);
 
@@ -1868,6 +1875,7 @@ static struct lo_inode_plock *lookup_create_plock_ctx(struct lo_data *lo,
 	plock->fd = fd;
 	g_hash_table_insert(inode->posix_locks,
 			    GUINT_TO_POINTER(plock->lock_owner), plock);
+	fuse_log(FUSE_LOG_DEBUG, "lookup_create_plock_ctx(): Inserted element in posix_locks hash table with value pointer %p\n", plock);
 	return plock;
 }
 
@@ -2046,6 +2054,7 @@ static void lo_flush(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
 	(void) ino;
 	struct lo_inode *inode;
 	struct lo_inode_plock *plock;
+	struct flock flock;
 
 	inode = lo_inode(req, ino);
 	if (!inode) {
@@ -2058,14 +2067,16 @@ static void lo_flush(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
 	plock = g_hash_table_lookup(inode->posix_locks,
 				    GUINT_TO_POINTER(fi->lock_owner));
 	if (plock) {
-		g_hash_table_remove(inode->posix_locks,
-				    GUINT_TO_POINTER(fi->lock_owner));
 		/*
-		 * We had used open() for locks and had only one fd. So
-		 * closing this fd should release all OFD locks.
+		 * An fd is being closed. For posix locks, this means
+		 * drop all the associated locks.
 		 */
-		close(plock->fd);
-		free(plock);
+		memset(&flock, 0, sizeof(struct flock));
+		flock.l_type = F_UNLCK;
+		flock.l_whence = SEEK_SET;
+		/* Unlock whole file */
+		flock.l_start = flock.l_len = 0;
+		fcntl(plock->fd, F_OFD_SETLK, &flock);
 	}
 	pthread_mutex_unlock(&inode->plock_mutex);
 
