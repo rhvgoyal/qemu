@@ -74,6 +74,7 @@ struct fuse_session {
 	char *vu_socket_lock;
 	struct fv_VuDev *virtio_dev;
 	int thread_pool_size;
+	bool notify_enabled;
 };
 
 struct fuse_chan {

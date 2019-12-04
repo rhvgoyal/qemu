@@ -44,7 +44,7 @@ static void vhost_user_fs_pci_realize(VirtIOPCIProxy *vpci_dev, Error **errp)
     uint64_t totalsize;
 
     if (vpci_dev->nvectors == DEV_NVECTORS_UNSPECIFIED) {
-        vpci_dev->nvectors = dev->vdev.conf.num_request_queues + 1;
+        vpci_dev->nvectors = dev->vdev.conf.num_request_queues + 2;
     }
 
     qdev_set_parent_bus(vdev, BUS(&vpci_dev->bus));
