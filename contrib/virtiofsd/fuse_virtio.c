@@ -50,12 +50,6 @@ struct fv_QueueInfo {
     int qidx;
     int kick_fd;
     int kill_fd; /* For killing the thread */
-
-    /* The element for the command currently being processed */
-    VuVirtqElement *qe;
-    /* If any of the qe vec elements (towards vmm) are unmappable */
-    unsigned int elem_bad_in;
-    bool reply_sent;
 };
 
 /* A FUSE request */
