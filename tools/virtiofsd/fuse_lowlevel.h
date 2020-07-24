@@ -310,7 +310,7 @@ struct fuse_lowlevel_ops {
      * @param fi file information, or NULL
      */
     void (*setattr)(fuse_req_t req, fuse_ino_t ino, struct stat *attr,
-                    int to_set, struct fuse_file_info *fi);
+                    int to_set, unsigned int flags, struct fuse_file_info *fi);
 
     /**
      * Read symbolic link

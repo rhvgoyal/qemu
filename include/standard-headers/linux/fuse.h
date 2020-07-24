@@ -338,6 +338,7 @@ struct fuse_file_lock {
 #define FUSE_NO_OPENDIR_SUPPORT (1 << 24)
 #define FUSE_EXPLICIT_INVAL_DATA (1 << 25)
 #define FUSE_MAP_ALIGNMENT	(1 << 26)
+#define FUSE_HANDLE_KILLPRIV_V2	(1 << 27)
 
 /**
  * CUSE INIT request/reply flags
@@ -356,6 +357,14 @@ struct fuse_file_lock {
  * Getattr flags
  */
 #define FUSE_GETATTR_FH		(1 << 0)
+
+/**
+ * Setattr flags
+ * FUSE_SETATTR_KILL_PRIV: kill suid and sgid bits. sgid should be killed
+ * only if group execute bit (S_IXGRP) is set. Meant to be used together
+ * with FUSE_HANDLE_KILLPRIV_V2.
+ */
+#define FUSE_SETATTR_KILL_PRIV (1 << 0)
 
 /**
  * Lock flags
@@ -560,7 +569,7 @@ struct fuse_link_in {
 
 struct fuse_setattr_in {
 	uint32_t	valid;
-	uint32_t	padding;
+	uint32_t	setattr_flags;
 	uint64_t	fh;
 	uint64_t	size;
 	uint64_t	lock_owner;

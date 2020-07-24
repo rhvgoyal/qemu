@@ -883,7 +883,8 @@ static void do_setattr(fuse_req_t req, fuse_ino_t nodeid,
                       FUSE_SET_ATTR_ATIME_NOW | FUSE_SET_ATTR_MTIME_NOW |
                       FUSE_SET_ATTR_CTIME;
 
-        req->se->op.setattr(req, nodeid, &stbuf, arg->valid, fi);
+        req->se->op.setattr(req, nodeid, &stbuf, arg->valid,
+                            arg->setattr_flags, fi);
     } else {
         fuse_reply_err(req, ENOSYS);
     }
@@ -2081,6 +2082,9 @@ static void do_init(fuse_req_t req, fuse_ino_t nodeid,
             bufsize = max_bufsize;
         }
     }
+    if (arg->flags & FUSE_HANDLE_KILLPRIV_V2) {
+        se->conn.capable |= FUSE_CAP_HANDLE_KILLPRIV_V2;
+    }
 #ifdef HAVE_SPLICE
 #ifdef HAVE_VMSPLICE
     se->conn.capable |= FUSE_CAP_SPLICE_WRITE | FUSE_CAP_SPLICE_MOVE;
@@ -2216,6 +2220,10 @@ static void do_init(fuse_req_t req, fuse_ino_t nodeid,
 
         /* This constraint comes from mmap(2) and munmap(2) */
         outarg.map_alignment = ffsl(sysconf(_SC_PAGE_SIZE)) - 1;
+    }
+
+    if (se->conn.want & FUSE_CAP_HANDLE_KILLPRIV_V2) {
+        outarg.flags |= FUSE_HANDLE_KILLPRIV_V2;
     }
 
     fuse_log(FUSE_LOG_DEBUG, "   INIT: %u.%u\n", outarg.major, outarg.minor);
