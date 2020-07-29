@@ -972,13 +972,43 @@ static bool fv_socket_lock(struct fuse_session *se)
     g_autofree gchar *pidfile = NULL;
     g_autofree gchar *dir = NULL;
     Error *local_err = NULL;
+    gboolean unprivileged = false;
 
-    dir = qemu_get_local_state_pathname("run/virtiofsd");
+    if (geteuid() != 0)
+        unprivileged = true;
 
-    if (g_mkdir_with_parents(dir, S_IRWXU) < 0) {
-        fuse_log(FUSE_LOG_ERR, "%s: Failed to create directory %s: %s",
-                 __func__, dir, strerror(errno));
-        return false;
+    /*
+     * Unpriviliged users don't have access to /usr/local/var. Hence
+     * store lock/pid file in per user directory. Use environment
+     * variable XDG_RUNTIME_DIR.
+     * If one logs into the system as root and then does "su" then
+     * XDG_RUNTIME_DIR still points to root user directory. In that
+     * case create a directory for user in /tmp/$UID
+     */
+    if (unprivileged) {
+        gchar *user_dir = NULL;
+        gboolean create_dir = false;
+        user_dir = g_strdup(g_get_user_runtime_dir());
+        if (!user_dir || g_str_has_suffix(user_dir, "/0")) {
+            user_dir = g_strdup_printf("/tmp/%d", geteuid());
+            create_dir = true;
+        }
+
+        if (create_dir && g_mkdir_with_parents(user_dir, S_IRWXU) < 0) {
+            fuse_log(FUSE_LOG_ERR, "%s: Failed to create directory %s: %s",
+                     __func__, user_dir, strerror(errno));
+            g_free(user_dir);
+            return false;
+        }
+        dir = g_strdup(user_dir);
+        g_free(user_dir);
+    } else {
+        dir = qemu_get_local_state_pathname("run/virtiofsd");
+        if (g_mkdir_with_parents(dir, S_IRWXU) < 0) {
+            fuse_log(FUSE_LOG_ERR, "%s: Failed to create directory %s: %s",
+                     __func__, dir, strerror(errno));
+            return false;
+        }
     }
 
     sk_name = g_strdup(se->vu_socket_path);
