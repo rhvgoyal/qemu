@@ -147,11 +147,13 @@ enum {
 enum {
     SANDBOX_NAMESPACE,
     SANDBOX_CHROOT,
+    SANDBOX_NONE,
 };
 
 struct lo_data {
     pthread_mutex_t mutex;
     int sandbox;
+    bool unprivileged;
     int debug;
     int writeback;
     int flock;
@@ -3287,6 +3289,12 @@ int main(int argc, char *argv[])
 
     lo_map_init(&lo.dirp_map);
     lo_map_init(&lo.fd_map);
+
+    if (geteuid() != 0) {
+       lo.unprivileged = true;
+       lo.sandbox = SANDBOX_NONE;
+       fuse_log(FUSE_LOG_DEBUG, "Running in unprivileged passthrough mode.\n");
+    }
 
     if (fuse_parse_cmdline(&args, &opts) != 0) {
         goto err_out1;
