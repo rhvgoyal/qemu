@@ -2969,6 +2969,15 @@ static void setup_capabilities(char *modcaps_in)
     pthread_mutex_unlock(&cap.mutex);
 }
 
+static void setup_none(struct lo_data *lo)
+{
+    lo->proc_self_fd = open("/proc/self/fd", O_PATH);
+    if (lo->proc_self_fd == -1) {
+        fuse_log(FUSE_LOG_ERR, "open(\"/proc/self/fd\", O_PATH): %m\n");
+        exit(1);
+    }
+}
+
 /*
  * Use chroot as a weaker sandbox for environments where the process is
  * launched without CAP_SYS_ADMIN.
@@ -3014,8 +3023,10 @@ static void setup_sandbox(struct lo_data *lo, struct fuse_session *se,
     if (lo->sandbox == SANDBOX_NAMESPACE) {
         setup_namespaces(lo, se);
         setup_mounts(lo->source);
-    } else {
+    } else if (lo->sandbox == SANDBOX_CHROOT) {
         setup_chroot(lo);
+    } else {
+        setup_none(lo);
     }
 
     setup_seccomp(enable_syslog);
