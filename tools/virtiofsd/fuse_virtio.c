@@ -972,8 +972,21 @@ static bool fv_socket_lock(struct fuse_session *se)
     g_autofree gchar *pidfile = NULL;
     g_autofree gchar *dir = NULL;
     Error *local_err = NULL;
+    gboolean unprivileged = false;
 
-    dir = qemu_get_local_state_pathname("run/virtiofsd");
+    if (geteuid() != 0)
+        unprivileged = true;
+
+    /*
+     * Unpriviliged users don't have access to /usr/local/var. Hence
+     * store lock/pid file in per user cache directory. Use environment
+     * variable XDG_RUNTIME_DIR.
+     */
+    if (unprivileged) {
+        dir = g_strdup_printf("%s/virtiofsd", g_get_user_runtime_dir());
+    } else {
+        dir = qemu_get_local_state_pathname("run/virtiofsd");
+    }
 
     if (g_mkdir_with_parents(dir, S_IRWXU) < 0) {
         fuse_log(FUSE_LOG_ERR, "%s: Failed to create directory %s: %s",
