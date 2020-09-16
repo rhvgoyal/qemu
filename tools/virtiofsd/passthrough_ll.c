@@ -170,6 +170,7 @@ struct lo_data {
 
     /* An O_PATH file descriptor to /proc/self/fd/ */
     int proc_self_fd;
+    int user_killpriv_v2, killpriv_v2;
 };
 
 static const struct fuse_opt lo_opts[] = {
@@ -192,6 +193,8 @@ static const struct fuse_opt lo_opts[] = {
     { "no_shared", offsetof(struct lo_data, shared), 0 },
     { "readdirplus", offsetof(struct lo_data, readdirplus_set), 1 },
     { "no_readdirplus", offsetof(struct lo_data, readdirplus_clear), 1 },
+    { "killpriv_v2", offsetof(struct lo_data, user_killpriv_v2), 1 },
+    { "no_killpriv_v2", offsetof(struct lo_data, user_killpriv_v2), 0 },
     FUSE_OPT_END
 };
 static bool use_syslog = false;
@@ -588,6 +591,30 @@ static void lo_init(void *userdata, struct fuse_conn_info *conn)
         fuse_log(FUSE_LOG_DEBUG, "lo_init: disabling readdirplus\n");
         conn->want &= ~FUSE_CAP_READDIRPLUS;
     }
+
+    if (lo->user_killpriv_v2 == 1) {
+        /* User explicitly asked for this option. Enable it unconditionally.
+         * If connection does not have this capability, it should fail
+         * in fuse_lowlevel.c
+         */
+        fuse_log(FUSE_LOG_DEBUG, "lo_init: enabling killpriv_v2\n");
+        conn->want |= FUSE_CAP_HANDLE_KILLPRIV_V2;
+	lo->killpriv_v2 = 1;
+    } else if (lo->user_killpriv_v2 == -1 &&
+               conn->capable & FUSE_CAP_HANDLE_KILLPRIV_V2) {
+        /* User did not specify a value for killpriv_v2. By default enable it
+         * if connection offers this capability */
+        fuse_log(FUSE_LOG_DEBUG, "lo_init: enabling killpriv_v2\n");
+        conn->want |= FUSE_CAP_HANDLE_KILLPRIV_V2;
+        lo->killpriv_v2 = 1;
+    } else {
+        /* Either user specified to disable killpriv_v2, or connection does
+         * not offer this capability. Disable killpriv_v2 in both the cases
+         */
+        fuse_log(FUSE_LOG_DEBUG, "lo_init: disabling killpriv_v2\n");
+        conn->want &= ~FUSE_CAP_HANDLE_KILLPRIV_V2;
+        lo->killpriv_v2 = 0;
+    }
 }
 
 static int64_t *version_ptr(struct lo_data *lo, struct lo_inode *inode)
@@ -686,6 +713,14 @@ static void lo_setattr(fuse_req_t req, fuse_ino_t ino, struct stat *attr,
         uid_t uid = (valid & FUSE_SET_ATTR_UID) ? attr->st_uid : (uid_t)-1;
         gid_t gid = (valid & FUSE_SET_ATTR_GID) ? attr->st_gid : (gid_t)-1;
 
+        /* if fc->killpriv_v2 is set, change of ownership should clear
+         * suid/sgid/caps.
+         *
+         * TODO: On ext4/xfs above works with fchownat() call without
+         * doing anything extra. If there are filesystem where this
+         * does not work, virtiofsd needs to take care of this.
+         */
+
         res = fchownat(ifd, "", uid, gid, AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW);
         if (res == -1) {
             goto out_err;
@@ -693,7 +728,18 @@ static void lo_setattr(fuse_req_t req, fuse_ino_t ino, struct stat *attr,
     }
     if (valid & FUSE_SET_ATTR_SIZE) {
         int truncfd;
+        bool kill_priv = lo->killpriv_v2 && (valid & FUSE_SET_ATTR_KILL_PRIV);
+        bool cap_fsetid_dropped = false;
 
+        /* if fc->killpriv_v2 is set, change of size should clear caps
+         * always. suid should be cleared if FUSE_SETATTR_KILL_PRIV is
+         * set. And sgid should be cleared if FUSE_SETATTR_KILL_PRIV is
+         * set as well as group execute permission is on.
+         *
+         * TODO: On ext4/xfs above works with truncate() call without
+         * doing anything extra. If there are filesystem where this
+         * does not work, virtiofsd needs to take care of this.
+         */
         if (fi) {
             truncfd = fd;
         } else {
@@ -704,12 +750,26 @@ static void lo_setattr(fuse_req_t req, fuse_ino_t ino, struct stat *attr,
             }
         }
 
-        res = ftruncate(truncfd, attr->st_size);
-        if (!fi) {
-            saverr = errno;
-            close(truncfd);
-            errno = saverr;
+        if (kill_priv) {
+            res = drop_effective_cap("FSETID", &cap_fsetid_dropped);
+            if (res != 0) {
+                lo_inode_put(lo, &inode);
+                fuse_reply_err(req, res);
+            }
         }
+        res = ftruncate(truncfd, attr->st_size);
+        saverr = errno;
+        if (cap_fsetid_dropped) {
+            res = gain_effective_cap("FSETID");
+            if(res) {
+                fuse_log(FUSE_LOG_ERR, "Failed to gain CAP_FSETID\n");
+            }
+        }
+        if (!fi) {
+            close(truncfd);
+        }
+
+        errno = saverr;
         if (res == -1) {
             goto out_err;
         }
@@ -1943,20 +2003,45 @@ static void lo_fsyncdir(fuse_req_t req, fuse_ino_t ino, int datasync,
 
 static void lo_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
 {
-    int fd;
+    int fd, ret, saverr;
     ssize_t fh;
     char buf[64];
     struct lo_data *lo = lo_data(req);
+    bool cap_fsetid_dropped = false;
 
-    fuse_log(FUSE_LOG_DEBUG, "lo_open(ino=%" PRIu64 ", flags=%d)\n", ino,
-             fi->flags);
+    fuse_log(FUSE_LOG_DEBUG, "lo_open(ino=%" PRIu64 ", flags=%d, kill_priv=%d)"
+             "\n", ino, fi->flags, fi->kill_priv);
 
     update_open_flags(lo->writeback, fi);
 
     sprintf(buf, "%i", lo_fd(req, ino));
+
+    /*
+     * fi->kill_priv is set if file server opted for killpriv_v2 feature
+     * and client did open(O_TRUNC) and caller did not have CAP_FSETID.
+     * In that case suid/sgid/security.capability needs to be killed
+     * according to certain rules. Dropping capability does right thing
+     * on ext4/xfs already.
+     */
+    if (fi->kill_priv) {
+        ret = drop_effective_cap("FSETID", &cap_fsetid_dropped);
+        if (ret != 0) {
+            fuse_reply_err(req, ret);
+            return;
+        }
+    }
+
     fd = openat(lo->proc_self_fd, buf, fi->flags & ~O_NOFOLLOW);
+    saverr = errno;
+    if (cap_fsetid_dropped) {
+        ret = gain_effective_cap("FSETID");
+        if (ret) {
+            fuse_log(FUSE_LOG_ERR, "Failed to gain CAP_FSETID\n");
+        }
+    }
+
     if (fd == -1) {
-        return (void)fuse_reply_err(req, errno);
+        return (void)fuse_reply_err(req, saverr);
     }
 
     pthread_mutex_lock(&lo->mutex);
@@ -2091,8 +2176,20 @@ static void lo_write_buf(fuse_req_t req, fuse_ino_t ino,
     out_buf.buf[0].pos = off;
 
     fuse_log(FUSE_LOG_DEBUG,
-             "lo_write_buf(ino=%" PRIu64 ", size=%zd, off=%lu)\n", ino,
-             out_buf.buf[0].size, (unsigned long)off);
+             "lo_write_buf(ino=%" PRIu64 ", size=%zd, off=%lu kill_priv=%d)\n",
+             ino, out_buf.buf[0].size, (unsigned long)off, fi->kill_priv);
+
+    /*
+     * If lo->killpriv_v2 is set, then we are supposed to kill caps
+     * and also kill suid/sgid if fi->kill_priv is set. Current
+     * common filesystem ext4/xfs already drop security.capability
+     * on WRITE. So we don't have to do anything special.
+     *
+     * TODO: If we are running on to of a file system which does not
+     * remove caps on WRITE, then we will have to remove it ourselves
+     * explicitly. Same is true for removing SUID/SGID if CAP_FSETID
+     * is not there.
+     */
 
     /*
      * If kill_priv is set, drop CAP_FSETID which should lead to kernel
@@ -3210,6 +3307,7 @@ int main(int argc, char *argv[])
         .writeback = 0,
         .posix_lock = 1,
         .proc_self_fd = -1,
+        .user_killpriv_v2 = -1,
     };
     struct lo_map_elem *root_elem;
     int ret = -1;

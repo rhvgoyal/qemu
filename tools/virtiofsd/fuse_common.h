@@ -353,6 +353,16 @@ struct fuse_file_info {
 #define FUSE_CAP_NO_OPENDIR_SUPPORT (1 << 24)
 
 /**
+ * Indicates that the filesystem is responsible for unsetting
+ * setuid and setgid bits when a file is written, truncated, or
+ * its owner is changed. setuid/setgid is cleared on WRITE/truncate
+ * only if caller does not have CAP_FSETID. For WRITE requests
+ * this is communicated through write flag FUSE_WRITE_KILL_PRIV.
+ *
+ */
+#define FUSE_CAP_HANDLE_KILLPRIV_V2 (1 << 27)
+
+/**
  * Ioctl flags
  *
  * FUSE_IOCTL_COMPAT: 32bit compat ioctl on 64bit machine

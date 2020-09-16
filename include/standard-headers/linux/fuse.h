@@ -338,6 +338,7 @@ struct fuse_file_lock {
 #define FUSE_NO_OPENDIR_SUPPORT (1 << 24)
 #define FUSE_EXPLICIT_INVAL_DATA (1 << 25)
 #define FUSE_MAP_ALIGNMENT	(1 << 26)
+#define FUSE_HANDLE_KILLPRIV_V2	(1 << 27)
 
 /**
  * CUSE INIT request/reply flags
@@ -412,6 +413,13 @@ struct fuse_file_lock {
  * FUSE_FSYNC_FDATASYNC: Sync data only, not metadata
  */
 #define FUSE_FSYNC_FDATASYNC	(1 << 0)
+
+/**
+ * Open flags
+ * FUSE_OPEN_KILL_PRIV: Kill suid/sgid/security.capability. sgid is cleared
+ *                      only if file has group execute permission.
+ */
+#define FUSE_OPEN_KILL_PRIV    (1 << 0)
 
 enum fuse_opcode {
 	FUSE_LOOKUP		= 1,
@@ -579,7 +587,7 @@ struct fuse_setattr_in {
 
 struct fuse_open_in {
 	uint32_t	flags;
-	uint32_t	unused;
+	uint32_t	open_flags;
 };
 
 struct fuse_create_in {
