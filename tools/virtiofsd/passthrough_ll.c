@@ -40,6 +40,7 @@
 #include "fuse_virtio.h"
 #include "fuse_log.h"
 #include "fuse_lowlevel.h"
+#include "standard-headers/linux/fuse.h"
 #include <assert.h>
 #include <cap-ng.h>
 #include <dirent.h>
@@ -178,6 +179,7 @@ struct lo_data {
     int ireg_sock;
     int64_t *version_table;
     uint64_t version_table_size;
+    int announce_submounts;
     bool use_statx;
     struct lo_inode root;
     GHashTable *inodes; /* protected by lo->mutex */
@@ -220,6 +222,7 @@ static const struct fuse_opt lo_opts[] = {
     { "no_readdirplus", offsetof(struct lo_data, readdirplus_clear), 1 },
     { "allow_direct_io", offsetof(struct lo_data, allow_direct_io), 1 },
     { "no_allow_direct_io", offsetof(struct lo_data, allow_direct_io), 0 },
+    { "announce_submounts", offsetof(struct lo_data, announce_submounts), 1 },
     FUSE_OPT_END
 };
 static bool use_syslog = false;
@@ -617,6 +620,20 @@ static void lo_init(void *userdata, struct fuse_conn_info *conn)
         fuse_log(FUSE_LOG_DEBUG, "lo_init: disabling readdirplus\n");
         conn->want &= ~FUSE_CAP_READDIRPLUS;
     }
+
+    if (!(conn->capable & FUSE_CAP_SUBMOUNTS) && lo->announce_submounts) {
+        fuse_log(FUSE_LOG_WARNING, "lo_init: Cannot announce submounts, client "
+                 "does not support it\n");
+        lo->announce_submounts = false;
+    }
+
+#ifndef CONFIG_STATX
+    if (lo->announce_submounts) {
+        fuse_log(FUSE_LOG_WARNING, "lo_init: Cannot announce submounts, there "
+                 "is no statx()\n");
+        lo->announce_submounts = false;
+    }
+#endif
 }
 
 static int64_t *version_ptr(struct lo_data *lo, struct lo_inode *inode)
@@ -983,6 +1000,11 @@ static int lo_do_lookup(fuse_req_t req, fuse_ino_t parent, const char *name,
                    &mnt_id);
     if (res == -1) {
         goto out_err;
+    }
+
+    if (S_ISDIR(e->attr.st_mode) && lo->announce_submounts &&
+        (e->attr.st_dev != dir->key.dev || mnt_id != dir->key.mnt_id)) {
+        e->attr_flags |= FUSE_ATTR_SUBMOUNT;
     }
 
     inode = lo_find(lo, &e->attr, mnt_id);
