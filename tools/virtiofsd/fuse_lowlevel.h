@@ -106,6 +106,10 @@ struct fuse_entry_param {
 
     uint64_t version_offset;
     int64_t initial_version;
+    /**
+     * Flags for fuse_attr.flags that do not fit into attr.
+     */
+    uint32_t attr_flags;
 };
 
 /**
