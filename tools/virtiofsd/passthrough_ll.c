@@ -626,14 +626,6 @@ static void lo_init(void *userdata, struct fuse_conn_info *conn)
                  "does not support it\n");
         lo->announce_submounts = false;
     }
-
-#ifndef CONFIG_STATX
-    if (lo->announce_submounts) {
-        fuse_log(FUSE_LOG_WARNING, "lo_init: Cannot announce submounts, there "
-                 "is no statx()\n");
-        lo->announce_submounts = false;
-    }
-#endif
 }
 
 static int64_t *version_ptr(struct lo_data *lo, struct lo_inode *inode)
