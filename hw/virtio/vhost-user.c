@@ -80,6 +80,7 @@ enum VhostUserProtocolFeature {
     VHOST_USER_PROTOCOL_F_RESET_DEVICE = 13,
     /* Feature 14 reserved for VHOST_USER_PROTOCOL_F_INBAND_NOTIFICATIONS. */
     VHOST_USER_PROTOCOL_F_CONFIGURE_MEM_SLOTS = 15,
+    VHOST_USER_PROTOCOL_F_SLAVE_CH_START_STOP = 16,
     VHOST_USER_PROTOCOL_F_MAX
 };
 
@@ -125,6 +126,8 @@ typedef enum VhostUserRequest {
     VHOST_USER_GET_MAX_MEM_SLOTS = 36,
     VHOST_USER_ADD_MEM_REG = 37,
     VHOST_USER_REM_MEM_REG = 38,
+    VHOST_USER_START_SLAVE_CHANNEL = 39,
+    VHOST_USER_STOP_SLAVE_CHANNEL = 40,
     VHOST_USER_MAX
 } VhostUserRequest;
 
@@ -138,6 +141,7 @@ typedef enum VhostUserSlaveRequest {
     VHOST_USER_SLAVE_FS_MAP = 6,
     VHOST_USER_SLAVE_FS_UNMAP = 7,
     VHOST_USER_SLAVE_FS_IO = 8,
+    VHOST_USER_SLAVE_STOP_CHANNEL_COMPLETE = 9,
     VHOST_USER_SLAVE_MAX
 }  VhostUserSlaveRequest;
 
@@ -245,6 +249,7 @@ struct vhost_user {
     /* Shared between vhost devs of the same virtio device */
     VhostUserState *user;
     int slave_fd;
+    bool slave_channel_open;
     NotifierWithReturn postcopy_notifier;
     struct PostCopyFD  postcopy_fd;
     uint64_t           postcopy_client_bases[VHOST_USER_MAX_RAM_SLOTS];
@@ -1508,6 +1513,10 @@ static int do_slave_read(void *opaque)
         ret = vhost_user_fs_slave_io(dev, &payload.fs, fd[0]);
         break;
 #endif
+    case VHOST_USER_SLAVE_STOP_CHANNEL_COMPLETE:
+        u->slave_channel_open = false;
+        ret = 0;
+        break;
     default:
         error_report("Received unexpected msg type: %d.", hdr.request);
         ret = (uint64_t)-EINVAL;
@@ -1575,6 +1584,70 @@ err:
 static void slave_read(void *opaque)
 {
     do_slave_read(opaque);
+}
+
+static int vhost_start_slave_channel(struct vhost_dev *dev)
+{
+    struct vhost_user *u = dev->opaque;
+    VhostUserMsg msg = {
+        .hdr.request = VHOST_USER_START_SLAVE_CHANNEL,
+        .hdr.flags = VHOST_USER_VERSION | VHOST_USER_NEED_REPLY_MASK,
+    };
+    int ret = 0;
+
+    if (!virtio_has_feature(dev->protocol_features,
+                            VHOST_USER_PROTOCOL_F_SLAVE_CH_START_STOP)) {
+        return 0;
+    }
+
+    ret = vhost_user_write(dev, &msg, NULL, 0);
+    if (ret) {
+        return ret;
+    }
+
+    ret = process_message_reply(dev, &msg);
+    if (ret)
+        return ret;
+
+    u->slave_channel_open = true;
+    return ret;
+}
+
+static int vhost_stop_slave_channel(struct vhost_dev *dev)
+{
+    struct vhost_user *u = dev->opaque;
+    VhostUserMsg msg = {
+        .hdr.request = VHOST_USER_STOP_SLAVE_CHANNEL,
+        .hdr.flags = VHOST_USER_VERSION | VHOST_USER_NEED_REPLY_MASK,
+    };
+    int ret = 0;
+
+    if (!virtio_has_feature(dev->protocol_features,
+                            VHOST_USER_PROTOCOL_F_SLAVE_CH_START_STOP)) {
+        return 0;
+    }
+
+    ret = vhost_user_write(dev, &msg, NULL, 0);
+    if (ret) {
+        return ret;
+    }
+
+    ret = process_message_reply(dev, &msg);
+    if (ret) {
+        return ret;
+    }
+
+    /*
+     * Wait for flush finish message from slave. And continue to process
+     * slave messages till we get flush finish.
+     */
+    while (u->slave_channel_open) {
+        ret = do_slave_read(dev);
+        if (ret)
+            break;
+    }
+
+    return ret;
 }
 
 static int vhost_setup_slave_channel(struct vhost_dev *dev)
@@ -1857,6 +1930,7 @@ static int vhost_user_backend_init(struct vhost_dev *dev, void *opaque)
     u = g_new0(struct vhost_user, 1);
     u->user = opaque;
     u->slave_fd = -1;
+    u->slave_channel_open = false;
     u->dev = dev;
     dev->opaque = u;
 
@@ -1931,6 +2005,17 @@ static int vhost_user_backend_init(struct vhost_dev *dev, void *opaque)
 
             u->user->memory_slots = MIN(ram_slots, VHOST_USER_MAX_RAM_SLOTS);
         }
+
+        if (virtio_has_feature(dev->protocol_features,
+                               VHOST_USER_PROTOCOL_F_SLAVE_CH_START_STOP) &&
+                !(virtio_has_feature(dev->protocol_features,
+                    VHOST_USER_PROTOCOL_F_SLAVE_REQ) &&
+                 virtio_has_feature(dev->protocol_features,
+                    VHOST_USER_PROTOCOL_F_REPLY_ACK))) {
+            error_report("Slave channel start/stop support requires reply-ack"
+                         " and slave-req protocol features.");
+            return -1;
+        }
     }
 
     if (dev->migration_blocker == NULL &&
@@ -1943,6 +2028,10 @@ static int vhost_user_backend_init(struct vhost_dev *dev, void *opaque)
 
     if (dev->vq_index == 0) {
         err = vhost_setup_slave_channel(dev);
+        if (err < 0) {
+            return err;
+        }
+        err = vhost_start_slave_channel(dev);
         if (err < 0) {
             return err;
         }
@@ -2405,6 +2494,24 @@ void vhost_user_cleanup(VhostUserState *user)
     user->chr = NULL;
 }
 
+static int vhost_user_dev_start(struct vhost_dev *dev, bool started)
+{
+    int ret;
+
+    if (!started) {
+        ret = vhost_stop_slave_channel(dev);
+        if (ret < 0) {
+            return ret;
+        }
+    } else {
+        ret = vhost_start_slave_channel(dev);
+        if (ret < 0) {
+            return ret;
+        }
+    }
+    return 0;
+}
+
 const VhostOps user_ops = {
         .backend_type = VHOST_BACKEND_TYPE_USER,
         .vhost_backend_init = vhost_user_backend_init,
@@ -2431,6 +2538,7 @@ const VhostOps user_ops = {
         .vhost_net_set_mtu = vhost_user_net_set_mtu,
         .vhost_set_iotlb_callback = vhost_user_set_iotlb_callback,
         .vhost_send_device_iotlb_msg = vhost_user_send_device_iotlb_msg,
+        .vhost_dev_start = vhost_user_dev_start,
         .vhost_get_config = vhost_user_get_config,
         .vhost_set_config = vhost_user_set_config,
         .vhost_crypto_create_session = vhost_user_crypto_create_session,
