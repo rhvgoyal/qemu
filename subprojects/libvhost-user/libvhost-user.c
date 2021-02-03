@@ -403,7 +403,7 @@ vu_send_reply(VuDev *dev, int conn_fd, VhostUserMsg *vmsg)
  * Processes a reply on the slave channel.
  * Entered with slave_mutex held and releases it before exit.
  * Returns true on success.
- * *payload is written on success
+ * *payload is written on success, if payload is not NULL.
  */
 static bool
 vu_process_message_reply(VuDev *dev, const VhostUserMsg *vmsg,
@@ -427,12 +427,33 @@ vu_process_message_reply(VuDev *dev, const VhostUserMsg *vmsg,
         goto out;
     }
 
-    *payload = msg_reply.payload.u64;
+    if (payload) {
+        *payload = msg_reply.payload.u64;
+    }
     result = true;
 
 out:
     pthread_mutex_unlock(&dev->slave_mutex);
     return result;
+}
+
+/* Returns true on success, false otherwise */
+static bool
+vu_message_slave_send_receive(VuDev *dev, VhostUserMsg *vmsg, uint64_t *payload)
+{
+    pthread_mutex_lock(&dev->slave_mutex);
+    if (!vu_message_write(dev, dev->slave_fd, vmsg)) {
+        pthread_mutex_unlock(&dev->slave_mutex);
+        return false;
+    }
+
+    if ((vmsg->flags & VHOST_USER_NEED_REPLY_MASK) == 0) {
+        pthread_mutex_unlock(&dev->slave_mutex);
+        return true;
+    }
+
+    /* Also unlocks the slave_mutex */
+    return vu_process_message_reply(dev, vmsg, payload);
 }
 
 /* Kick the log_call_fd if required. */
@@ -1340,16 +1361,8 @@ bool vu_set_queue_host_notifier(VuDev *dev, VuVirtq *vq, int fd,
         return false;
     }
 
-    pthread_mutex_lock(&dev->slave_mutex);
-    if (!vu_message_write(dev, dev->slave_fd, &vmsg)) {
-        pthread_mutex_unlock(&dev->slave_mutex);
-        return false;
-    }
-
-    /* Also unlocks the slave_mutex */
-    res = vu_process_message_reply(dev, &vmsg, &payload);
+    res = vu_message_slave_send_receive(dev, &vmsg, &payload);
     res = res && (payload == 0);
-
     return res;
 }
 
@@ -2395,10 +2408,7 @@ static void _vu_queue_notify(VuDev *dev, VuVirtq *vq, bool sync)
             vmsg.flags |= VHOST_USER_NEED_REPLY_MASK;
         }
 
-        vu_message_write(dev, dev->slave_fd, &vmsg);
-        if (ack) {
-            vu_message_read_default(dev, dev->slave_fd, &vmsg);
-        }
+        vu_message_slave_send_receive(dev, &vmsg, NULL);
         return;
     }
 
@@ -2942,17 +2952,11 @@ int64_t vu_fs_cache_request(VuDev *dev, VhostUserSlaveRequest req, int fd,
         return -EINVAL;
     }
 
-    pthread_mutex_lock(&dev->slave_mutex);
-    if (!vu_message_write(dev, dev->slave_fd, &vmsg)) {
-        pthread_mutex_unlock(&dev->slave_mutex);
-        return -EIO;
-    }
-
-    /* Also unlocks the slave_mutex */
-    res = vu_process_message_reply(dev, &vmsg, &payload);
+    res = vu_message_slave_send_receive(dev, &vmsg, &payload);
     if (!res) {
         return -EIO;
     }
+
     /*
      * Payload is delivered as uint64_t but is actually signed for
      * errors.
