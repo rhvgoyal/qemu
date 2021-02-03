@@ -1400,7 +1400,7 @@ static uint64_t vhost_user_slave_handle_vring_host_notifier(
     return false;
 }
 
-static void slave_read(void *opaque)
+static int do_slave_read(void *opaque)
 {
     struct vhost_dev *dev = opaque;
     struct vhost_user *u = dev->opaque;
@@ -1431,13 +1431,22 @@ static void slave_read(void *opaque)
         size = recvmsg(u->slave_fd, &msgh, 0);
     } while (size < 0 && (errno == EINTR || errno == EAGAIN));
 
-    if (size != VHOST_USER_HDR_SIZE) {
+    if (size < 0) {
+        ret = -errno;
         error_report("Failed to read from slave.");
+        goto err;
+    }
+
+    if (size != VHOST_USER_HDR_SIZE) {
+        error_report("Read %d bytes from slave, expected %lu bytes", size,
+                     VHOST_USER_HDR_SIZE);
+        ret = -EBADMSG;
         goto err;
     }
 
     if (msgh.msg_flags & MSG_CTRUNC) {
         error_report("Truncated message.");
+        ret = -EBADMSG;
         goto err;
     }
 
@@ -1455,6 +1464,7 @@ static void slave_read(void *opaque)
         error_report("Failed to read msg header."
                 " Size %d exceeds the maximum %zu.", hdr.size,
                 VHOST_USER_PAYLOAD_SIZE);
+        ret = -EBADMSG;
         goto err;
     }
 
@@ -1463,8 +1473,16 @@ static void slave_read(void *opaque)
         size = read(u->slave_fd, &payload, hdr.size);
     } while (size < 0 && (errno == EINTR || errno == EAGAIN));
 
-    if (size != hdr.size) {
+    if (size < 0) {
+        ret = errno;
         error_report("Failed to read payload from slave.");
+        goto err;
+    }
+
+    if (size != hdr.size) {
+        error_report("Read %d payload bytes from slave, expected %d bytes",
+                     size, hdr.size);
+        ret = -EBADMSG;
         goto err;
     }
 
@@ -1525,13 +1543,22 @@ static void slave_read(void *opaque)
             size = writev(u->slave_fd, iovec, ARRAY_SIZE(iovec));
         } while (size < 0 && (errno == EINTR || errno == EAGAIN));
 
-        if (size != VHOST_USER_HDR_SIZE + hdr.size) {
+        if (size < 0) {
+            ret = -errno;
             error_report("Failed to send msg reply to slave.");
+            goto err;
+        }
+
+        if (size != VHOST_USER_HDR_SIZE + hdr.size) {
+            error_report("Failed to send msg reply to slave. Wrote %d bytes"
+                         " expected %lu bytes.", size,
+                         VHOST_USER_HDR_SIZE + hdr.size);
+            ret = -EIO;
             goto err;
         }
     }
 
-    return;
+    return 0;
 
 err:
     qemu_set_fd_handler(u->slave_fd, NULL, NULL, NULL);
@@ -1542,7 +1569,12 @@ err:
             close(fd[i]);
         }
     }
-    return;
+    return ret;
+}
+
+static void slave_read(void *opaque)
+{
+    do_slave_read(opaque);
 }
 
 static int vhost_setup_slave_channel(struct vhost_dev *dev)
