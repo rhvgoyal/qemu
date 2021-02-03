@@ -103,6 +103,11 @@ static void fv_set_features(VuDev *dev, uint64_t features)
 {
 }
 
+static uint64_t fv_get_protocol_features(VuDev *dev)
+{
+    return 1ULL << VHOST_USER_PROTOCOL_F_SLAVE_CH_START_STOP;
+}
+
 /*
  * Callback from libvhost-user if there's a new fd we're supposed to listen
  * to, typically a queue kick?
@@ -907,6 +912,7 @@ static const VuDevIface fv_iface = {
     .get_features = fv_get_features,
     .set_features = fv_set_features,
 
+    .get_protocol_features = fv_get_protocol_features,
     /* Don't need process message, we've not got any at vhost-user level */
     .queue_set_started = fv_queue_set_started,
 
