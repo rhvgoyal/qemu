@@ -800,6 +800,12 @@ static void *fv_queue_thread(void *opaque)
     return NULL;
 }
 
+/*
+ * This needs to be called with ->vu_dispatch_rwlock not taken as it will
+ * wait for fv_queue_thread to finish (pthread_join()). And if we wait
+ * with ->vu_dispatch_rwlock held, it is possible that fv_queue_thread()
+ * is waiting for the lock as well and that will be a deadlock.
+ */
 static void fv_queue_cleanup_thread(struct fv_VuDev *vud, int qidx)
 {
     int ret;
@@ -813,11 +819,13 @@ static void fv_queue_cleanup_thread(struct fv_VuDev *vud, int qidx)
         fuse_log(FUSE_LOG_ERR, "Eventfd_write for queue %d: %s\n",
                  qidx, strerror(errno));
     }
+
     ret = pthread_join(ourqi->thread, NULL);
     if (ret) {
         fuse_log(FUSE_LOG_ERR, "%s: Failed to join thread idx %d err %d\n",
                  __func__, qidx, ret);
     }
+
     pthread_mutex_destroy(&ourqi->vq_lock);
     close(ourqi->kill_fd);
     ourqi->kick_fd = -1;
@@ -880,7 +888,13 @@ static void fv_queue_set_started(VuDev *dev, int qidx, bool started)
             assert(0);
         }
     } else {
+        /*
+         * Drop ->vu_dispath_rwlock and reacquire. fv_queue_cleanup_thread()
+         * needs to be called with ->vu_dispatch_rwlock not taken.
+         */
+        pthread_rwlock_unlock(&vud->vu_dispatch_rwlock);
         fv_queue_cleanup_thread(vud, qidx);
+        pthread_rwlock_wrlock(&vud->vu_dispatch_rwlock);
     }
 }
 
@@ -949,10 +963,6 @@ int virtio_loop(struct fuse_session *se)
         }
     }
 
-    /*
-     * Make sure all fv_queue_thread()s quit on exit, as we're about to
-     * free virtio dev and fuse session, no one should access them anymore.
-     */
     for (int i = 0; i < se->virtio_dev->nqueues; i++) {
         if (!se->virtio_dev->qi[i]) {
             continue;
