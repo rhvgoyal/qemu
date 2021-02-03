@@ -64,6 +64,7 @@ enum VhostUserProtocolFeature {
     VHOST_USER_PROTOCOL_F_INFLIGHT_SHMFD = 12,
     VHOST_USER_PROTOCOL_F_INBAND_NOTIFICATIONS = 14,
     VHOST_USER_PROTOCOL_F_CONFIGURE_MEM_SLOTS = 15,
+    VHOST_USER_PROTOCOL_F_SLAVE_CH_START_STOP = 16,
 
     VHOST_USER_PROTOCOL_F_MAX
 };
@@ -109,6 +110,8 @@ typedef enum VhostUserRequest {
     VHOST_USER_GET_MAX_MEM_SLOTS = 36,
     VHOST_USER_ADD_MEM_REG = 37,
     VHOST_USER_REM_MEM_REG = 38,
+    VHOST_USER_START_SLAVE_CHANNEL = 39,
+    VHOST_USER_STOP_SLAVE_CHANNEL = 40,
     VHOST_USER_MAX
 } VhostUserRequest;
 
@@ -122,6 +125,7 @@ typedef enum VhostUserSlaveRequest {
     VHOST_USER_SLAVE_FS_MAP = 6,
     VHOST_USER_SLAVE_FS_UNMAP = 7,
     VHOST_USER_SLAVE_FS_IO = 8,
+    VHOST_USER_SLAVE_STOP_CHANNEL_COMPLETE = 9,
     VHOST_USER_SLAVE_MAX
 }  VhostUserSlaveRequest;
 
@@ -410,9 +414,11 @@ struct VuDev {
     VuVirtq *vq;
     VuDevInflightInfo inflight_info;
     int log_call_fd;
-    /* Must be held while using slave_fd */
+    /* Must be held while using slave_fd, slave_channel_open */
     pthread_mutex_t slave_mutex;
     int slave_fd;
+    /* If not set, do not send more requests on slave fd. */
+    bool slave_channel_open;
     uint64_t log_size;
     uint8_t *log_table;
     uint64_t features;
