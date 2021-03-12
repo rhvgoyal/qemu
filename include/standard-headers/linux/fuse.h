@@ -356,6 +356,7 @@ struct fuse_file_lock {
 #define FUSE_MAP_ALIGNMENT	(1 << 26)
 #define FUSE_SUBMOUNTS		(1 << 27)
 #define FUSE_HANDLE_KILLPRIV_V2	(1 << 28)
+#define FUSE_POSIX_ACL_UPDATE_MODE	(1 << 29)
 
 /**
  * CUSE INIT request/reply flags

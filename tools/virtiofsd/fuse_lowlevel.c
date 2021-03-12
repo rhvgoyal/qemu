@@ -1988,6 +1988,9 @@ static void do_init(fuse_req_t req, fuse_ino_t nodeid,
     if (arg->flags & FUSE_HANDLE_KILLPRIV_V2) {
         se->conn.capable |= FUSE_CAP_HANDLE_KILLPRIV_V2;
     }
+    if (arg->flags & FUSE_POSIX_ACL_UPDATE_MODE) {
+        se->conn.capable |= FUSE_CAP_POSIX_ACL_UPDATE_MODE;
+    }
 #ifdef HAVE_SPLICE
 #ifdef HAVE_VMSPLICE
     se->conn.capable |= FUSE_CAP_SPLICE_WRITE | FUSE_CAP_SPLICE_MOVE;
@@ -2020,6 +2023,7 @@ static void do_init(fuse_req_t req, fuse_ino_t nodeid,
     LL_SET_DEFAULT(se->op.readdirplus, FUSE_CAP_READDIRPLUS);
     LL_SET_DEFAULT(se->op.readdirplus && se->op.readdir,
                    FUSE_CAP_READDIRPLUS_AUTO);
+    LL_SET_DEFAULT(1, FUSE_CAP_POSIX_ACL_UPDATE_MODE);
     se->conn.time_gran = 1;
 
     if (bufsize < FUSE_MIN_READ_BUFFER) {
@@ -2121,6 +2125,10 @@ static void do_init(fuse_req_t req, fuse_ino_t nodeid,
 
     if (se->conn.want & FUSE_CAP_HANDLE_KILLPRIV_V2) {
         outarg.flags |= FUSE_HANDLE_KILLPRIV_V2;
+    }
+
+    if (se->conn.want & FUSE_CAP_POSIX_ACL_UPDATE_MODE) {
+        outarg.flags |= FUSE_POSIX_ACL_UPDATE_MODE;
     }
 
     fuse_log(FUSE_LOG_DEBUG, "   INIT: %u.%u\n", outarg.major, outarg.minor);

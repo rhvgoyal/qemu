@@ -373,6 +373,12 @@ struct fuse_file_info {
 #define FUSE_CAP_HANDLE_KILLPRIV_V2 (1 << 28)
 
 /**
+ * Indicates that client is reponsoble for updating mode when acls are
+ * changed, by sending explicit setattr request.
+ */
+#define FUSE_CAP_POSIX_ACL_UPDATE_MODE (1 << 29)
+
+/**
  * Ioctl flags
  *
  * FUSE_IOCTL_COMPAT: 32bit compat ioctl on 64bit machine
