@@ -179,6 +179,10 @@
  *  7.33
  *  - add FUSE_HANDLE_KILLPRIV_V2, FUSE_WRITE_KILL_SUIDGID, FATTR_KILL_SUIDGID
  *  - add FUSE_OPEN_KILL_SUIDGID
+ *  7.34
+ *  - add FUSE_SETXATTR_V2
+ *  - add FUSE_SETXATTR_FLAG_CAP_FSETID
+ *  - add FUSE_POSIX_ACL_UPDATE_MODE
  */
 
 #ifndef _LINUX_FUSE_H
@@ -210,7 +214,7 @@
 #define FUSE_KERNEL_VERSION 7
 
 /** Minor version number of this interface */
-#define FUSE_KERNEL_MINOR_VERSION 33
+#define FUSE_KERNEL_MINOR_VERSION 34
 
 /** The node ID of the root inode */
 #define FUSE_ROOT_ID 1
@@ -326,6 +330,12 @@ struct fuse_file_lock {
  *			does not have CAP_FSETID. Additionally upon
  *			write/truncate sgid is killed only if file has group
  *			execute permission. (Same as Linux VFS behavior).
+ * FUSE_SETXATTR_V2:	Does file server support V2 of struct fuse_setxattr_in
+ * FUSE_POSIX_ACL_UPDATE_MODE: File server is responsible for updating file
+ *                       inode mode (if any) due to acl. This includes clearing
+ *                       SGID if caller membership group does not match inode
+ *                       owner group and caller does not have CAP_FSETID. Check
+ *                       posix_acl_update_mode().
  */
 #define FUSE_ASYNC_READ		(1 << 0)
 #define FUSE_POSIX_LOCKS	(1 << 1)
@@ -356,6 +366,8 @@ struct fuse_file_lock {
 #define FUSE_MAP_ALIGNMENT	(1 << 26)
 #define FUSE_SUBMOUNTS		(1 << 27)
 #define FUSE_HANDLE_KILLPRIV_V2	(1 << 28)
+#define FUSE_SETXATTR_V2	(1 << 29)
+#define FUSE_POSIX_ACL_UPDATE_MODE	(1 << 30)
 
 /**
  * CUSE INIT request/reply flags
@@ -446,6 +458,12 @@ struct fuse_file_lock {
  * FUSE_OPEN_KILL_SUIDGID: Kill suid and sgid if executable
  */
 #define FUSE_OPEN_KILL_SUIDGID	(1 << 0)
+
+/**
+ * setxattr flags
+ * FUSE_SETXATTR_CAP_FSETID: Set if caller has CAP_FSETID
+ */
+#define FUSE_SETXATTR_CAP_FSETID	(1 << 0)
 
 enum fuse_opcode {
 	FUSE_LOOKUP		= 1,
@@ -680,6 +698,13 @@ struct fuse_fsync_in {
 struct fuse_setxattr_in {
 	uint32_t	size;
 	uint32_t	flags;
+};
+
+struct fuse_setxattr_in_v2 {
+	uint32_t	size;
+	uint32_t	flags;
+	uint32_t	setxattr_flags;
+	uint32_t	padding;
 };
 
 struct fuse_getxattr_in {

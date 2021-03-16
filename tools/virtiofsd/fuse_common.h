@@ -373,6 +373,26 @@ struct fuse_file_info {
 #define FUSE_CAP_HANDLE_KILLPRIV_V2 (1 << 28)
 
 /**
+ * Indicates that file server will expect "struct fuse_setxattr_in_v2" type
+ * of struct in setxattr requests
+ */
+#define FUSE_CAP_SETXATTR_V2 (1 << 29)
+
+/**
+ * Indicates that file server is responsible for updating file mode/permission
+ * bits of file when setxattr(system.posix_acl_access) is called. This happens
+ * only if posix acl is enabled. Also file server is responsible clearing
+ * SGID bit if following two conditions are true.
+ * - file's group ID  does  not  match the user's effective group ID or one
+ *   of the user's supplementary group IDs.
+ * - Caller does not have CAP_FSETID
+ * Read "man 2 chmod" for expected behavior. This path triggers when user
+ * changes access acl, and that can result in change of file mode bits
+ * and there too SGID bit needs to be cleared in above two conditions.
+ */
+#define FUSE_CAP_POSIX_ACL_UPDATE_MODE (1 << 30)
+
+/**
  * Ioctl flags
  *
  * FUSE_IOCTL_COMPAT: 32bit compat ioctl on 64bit machine
