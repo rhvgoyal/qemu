@@ -2719,6 +2719,65 @@ void fuse_session_destroy(struct fuse_session *se)
     g_free(se);
 }
 
+static void fsnotify_fd_destroy(gpointer data)
+{
+    struct fuse_fsnotify_fd *fsnotify_fd = data;
+
+    close(fsnotify_fd->fd);
+    g_free(fsnotify_fd);
+}
+
+static void fsnotify_key_destroy(gpointer data)
+{
+    g_free(data);
+}
+
+/*
+ * TODO: Need a better hash for this since there is a good probability of
+ * collisions
+ */
+static guint fsnotify_fh_hash(gconstpointer key)
+{
+	const struct fsnotify_fh_key *wkey = key;
+    int i;
+    guint sum = 0;
+    for (i = 0; i < wkey->f_handle->handle_bytes; i++) {
+        sum += (guint) wkey->f_handle->f_handle[i];
+    }
+
+    return (guint) (wkey->f_handle->handle_bytes +
+                    wkey->f_handle->handle_type + sum);
+}
+
+static gboolean fsnotify_fh_equal(gconstpointer a, gconstpointer b)
+{
+    const struct fsnotify_fh_key *wa = a;
+    const struct fsnotify_fh_key *wb = b;
+
+    return (wa->f_handle->handle_bytes == wb->f_handle->handle_bytes) &&
+           (wa->f_handle->handle_type == wb->f_handle->handle_type) &&
+           (strncmp((const char*)wa->f_handle->f_handle,
+                    (const char*)wb->f_handle->f_handle,
+                    wa->f_handle->handle_bytes) ==0);
+}
+
+void fuse_fsnotify_init(struct fuse_session *se)
+{
+    se->fsnotify = g_new0(struct fuse_fsnotify, 1);
+    /* Initialize the epoll file descriptor */
+    se->fsnotify->epoll_fd = -1;
+    /* Mark the remote fsnotify as not running yet */
+    se->fsnotify->thread_running = 0;
+    /* Lock to protect the fsnotify data */
+    fuse_mutex_init(&se->fsnotify->fs_lock);
+    /* Initialize the hashtables */
+    se->fsnotify->fsnotify_fds = g_hash_table_new_full(g_direct_hash,
+                                                     g_direct_equal, NULL,
+                                                     fsnotify_fd_destroy);
+    se->fsnotify->fh_to_inode = g_hash_table_new_full(fsnotify_fh_hash,
+                                                     fsnotify_fh_equal,
+                                                     fsnotify_key_destroy, NULL);
+}
 
 struct fuse_session *fuse_session_new(struct fuse_args *args,
                                       const struct fuse_lowlevel_ops *op,
