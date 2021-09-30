@@ -1706,6 +1706,27 @@ static void do_setlkw(fuse_req_t req, fuse_ino_t nodeid,
     do_setlk_common(req, nodeid, iter, 1);
 }
 
+static void do_fsnotify(fuse_req_t req, fuse_ino_t nodeid,
+                        struct fuse_mbuf_iter *iter)
+{
+    struct fuse_notify_fsnotify_in *arg;
+    uint64_t mask;
+
+    arg = fuse_mbuf_iter_advance(iter, sizeof(*arg));
+    if (!arg) {
+        fuse_reply_err(req, EINVAL);
+        return;
+    }
+
+    mask = arg->mask;
+
+    if (req->se->op.fsnotify) {
+        req->se->op.fsnotify(req, nodeid, mask);
+    } else {
+        fuse_reply_err(req, ENOSYS);
+    }
+}
+
 static int find_interrupted(struct fuse_session *se, struct fuse_req *req)
 {
     struct fuse_req *curr;
@@ -2333,6 +2354,41 @@ int fuse_lowlevel_notify_lock(struct fuse_session *se, uint64_t unique,
     return send_notify_iov(se, FUSE_NOTIFY_LOCK, iov, 2);
 }
 
+int fuse_lowlevel_notify_fsnotify(struct fuse_session *se,
+                                  uint32_t name_len, const char *pathname,
+                                  uint64_t mask, uint8_t notify_parent,
+                                  fuse_ino_t parentid, fuse_ino_t nodeid,
+                                  uint32_t generation)
+{
+    struct fuse_notify_fsnotify_out outarg = {0};
+    struct iovec iov[3];
+    int count;
+
+    outarg.mask = mask;
+    outarg.notify_parent = notify_parent;
+    outarg.inode = nodeid;
+    outarg.parent = parentid;
+    outarg.namelen = name_len;
+    outarg.generation = generation;
+
+    iov[1].iov_base = &outarg;
+    iov[1].iov_len = sizeof(outarg);
+
+    /*
+     * If the filename of the inode for which the event occurred is available
+     * then send it along with the event data
+     */
+    if (name_len > 0) {
+        iov[2].iov_base = (char *)pathname;
+        iov[2].iov_len = name_len;
+        count = 3;
+    } else {
+        count = 2;
+    }
+
+    return send_notify_iov(se, FUSE_NOTIFY_FSNOTIFY, iov, count);
+}
+
 int fuse_lowlevel_notify_store(struct fuse_session *se, fuse_ino_t ino,
                                off_t offset, struct fuse_bufvec *bufv)
 {
@@ -2449,6 +2505,7 @@ static struct {
     [FUSE_COPY_FILE_RANGE] = { do_copy_file_range, "COPY_FILE_RANGE" },
     [FUSE_LSEEK] = { do_lseek, "LSEEK" },
     [FUSE_SYNCFS] = { do_syncfs, "SYNCFS" },
+    [FUSE_FSNOTIFY] = { do_fsnotify, "FSNOTIFY" },
 };
 
 #define FUSE_MAXOP (sizeof(fuse_ll_ops) / sizeof(fuse_ll_ops[0]))

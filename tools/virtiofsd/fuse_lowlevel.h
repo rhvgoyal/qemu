@@ -1239,6 +1239,21 @@ struct fuse_lowlevel_ops {
      * @param ino the inode number
      */
     void (*syncfs)(fuse_req_t req, fuse_ino_t ino);
+
+    /**
+     * Perform an fsnotify action add, remove and modify a watch on an
+     * inode
+     *
+     * If this request fails it will return an error (EINVAL, ENOENT, EBADF)
+     * however the virtiofsd process will not exit. The guest process that is
+     * concerned about the remote events will not be able to receive any as
+     * long as it is alive.
+     *
+     * @param req request handle
+     * @param ino the inode number
+     * @param mask the watch mask attached to the inode
+     */
+    void (*fsnotify)(fuse_req_t req, fuse_ino_t ino, uint64_t mask);
 };
 
 /**
@@ -1723,6 +1738,26 @@ int fuse_lowlevel_notify_store(struct fuse_session *se, fuse_ino_t ino,
  */
 int fuse_lowlevel_notify_lock(struct fuse_session *se, uint64_t unique,
                               int32_t error);
+
+/**
+ * Send Fsnotify/Inotify event to the guest
+ *
+ * Similarly to what data a user-space application would receive from the
+ * inotify subsystem, this function sends the inotify data virtiofsd received
+ * for an inode to the guest.
+ *
+ * @param se the session object
+ * @param name_len the inode file name (link name) length
+ * @param pathname the inode file name
+ * @param mask the inode inotify watch mask
+ * @param notify_parent fsnotify flag to notify parent or not
+ * @param parentid the node number of the parent dir
+ * @param nodeid the inode numbe
+ */
+int fuse_lowlevel_notify_fsnotify(struct fuse_session *se, uint32_t name_len,
+                                  const char *pathanme, uint64_t mask,
+                                  uint8_t notify_parent, fuse_ino_t parentid,
+                                  fuse_ino_t nodeid, uint32_t generation);
 
 /*
  * Utility functions
