@@ -382,6 +382,15 @@ struct fuse_file_info {
  */
 #define FUSE_CAP_SECURITY_CTX (1ULL << 32)
 
+ /**
+  * Indicates that the kernel supports fsnotify for FUSE
+  *
+  * If this feature is enabled then the daemon is responsible for
+  * placing watches on inodes, check for events and notify the kernel
+  * module about these events.
+  */
+#define FUSE_CAP_FSNOTIFY_SUPPORT (1ULL << 34)
+
 /**
  * Ioctl flags
  *
