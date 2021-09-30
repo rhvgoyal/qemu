@@ -2125,6 +2125,9 @@ static void do_init(fuse_req_t req, fuse_ino_t nodeid,
     if (flags & FUSE_SECURITY_CTX) {
         se->conn.capable |= FUSE_CAP_SECURITY_CTX;
     }
+    if (flags & FUSE_HAVE_FSNOTIFY) {
+        se->conn.capable |= FUSE_CAP_FSNOTIFY_SUPPORT;
+    }
 #ifdef HAVE_SPLICE
 #ifdef HAVE_VMSPLICE
     se->conn.capable |= FUSE_CAP_SPLICE_WRITE | FUSE_CAP_SPLICE_MOVE;
@@ -2267,6 +2270,9 @@ static void do_init(fuse_req_t req, fuse_ino_t nodeid,
     if (se->conn.want & FUSE_CAP_SECURITY_CTX) {
         /* bits 32..63 get shifted down 32 bits into the flags2 field */
         outarg.flags2 |= FUSE_SECURITY_CTX >> 32;
+    }
+    if (se->conn.want & FUSE_CAP_FSNOTIFY_SUPPORT) {
+        outarg.flags2 |= FUSE_HAVE_FSNOTIFY >> 32;
     }
 
     fuse_log(FUSE_LOG_DEBUG, "   INIT: %u.%u\n", outarg.major, outarg.minor);
