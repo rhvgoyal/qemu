@@ -2764,6 +2764,8 @@ static gboolean fsnotify_fh_equal(gconstpointer a, gconstpointer b)
 void fuse_fsnotify_init(struct fuse_session *se)
 {
     se->fsnotify = g_new0(struct fuse_fsnotify, 1);
+    /* Set the in cleanup flag to inactive */
+    se->fsnotify->cleanup_fsnotify = 0;
     /* Initialize the epoll file descriptor */
     se->fsnotify->epoll_fd = -1;
     /* Mark the remote fsnotify as not running yet */

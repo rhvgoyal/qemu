@@ -55,10 +55,15 @@
 #include <sys/xattr.h>
 #include <syslog.h>
 #include <grp.h>
+#include <sys/fanotify.h>
+#include <sys/epoll.h>
 
 #include "qemu/cutils.h"
 #include "passthrough_helpers.h"
 #include "passthrough_seccomp.h"
+
+#define WHITESPACE " "
+#define MAX_EPOLL_EVENTS 10
 
 /* Keep track of inode posix locks for each owner. */
 struct lo_inode_plock {
@@ -172,6 +177,7 @@ struct lo_data {
     struct lo_map fd_map; /* protected by lo->mutex */
     XattrMapEntry *xattr_map_list;
     size_t xattr_map_nentries;
+    int fsnotify;
 
     /* An O_PATH file descriptor to /proc/self/fd/ */
     int proc_self_fd;
@@ -220,6 +226,8 @@ static const struct fuse_opt lo_opts[] = {
     { "no_posix_acl", offsetof(struct lo_data, user_posix_acl), 0 },
     { "security_label", offsetof(struct lo_data, user_security_label), 1 },
     { "no_security_label", offsetof(struct lo_data, user_security_label), 0 },
+    { "fsnotify", offsetof(struct lo_data, fsnotify), 1 },
+    { "no_fsnotify", offsetof(struct lo_data, fsnotify), 0 },
     FUSE_OPT_END
 };
 static bool use_syslog = false;
@@ -778,6 +786,249 @@ static struct file_handle *get_f_handle(char *pathname)
     return f_handle;
 }
 
+/*
+ * Function to handle the fsnotify events generated. If the event read is valid
+ * send it to the guest through the notification queue
+ */
+static void lo_handle_events(struct fuse_session *se, int fd)
+{
+    struct fuse_inode_info *inode_info;
+    struct fanotify_event_metadata buf[200];
+    const struct fanotify_event_metadata *metadata;
+    struct fanotify_event_info_fid *fid = NULL;
+    struct file_handle *f_handle;
+    struct fsnotify_fh_key *fh_key;
+    int event_offset = 0, send_event, records = 0;
+    fuse_ino_t nodeid = 0, parentid = 0;
+    uint32_t generation = 0;
+    uint32_t name_len = 0;
+    uint64_t mask = 0;
+    uint8_t notify_parent;
+    char *file_name = NULL;
+    ssize_t len;
+
+    for (;;) {
+
+        pthread_mutex_lock(&se->fsnotify->fs_lock);
+        /* First check if the fsnotify (fanotify) fd is still open when we read
+         * from it
+         */
+        if (fcntl(fd, F_GETFD) == -1) {
+            goto unlock;
+        }
+
+        len = read(fd, buf, sizeof(buf));
+        if (len == -1 && errno != EAGAIN) {
+            fuse_log(FUSE_LOG_ERR, "%s: Fanotify event read error\n", __func__);
+            goto unlock;
+        }
+
+        if (len <= 0) {
+            goto unlock;
+        }
+
+        /*
+         * Got a series of events so process them. Take the lock to
+         * guarantee that the inode goes away while we are sending the
+         * notifications
+         */
+        for (metadata = buf; FAN_EVENT_OK(metadata, len);
+            metadata = FAN_EVENT_NEXT(metadata, len)) {
+
+            event_offset = metadata->metadata_len;
+            send_event = false;
+            notify_parent = false;
+            file_name = NULL;
+            name_len = 0;
+            records = 0;
+            /* Account for the case of multiple event records */
+            while (event_offset < metadata->event_len) {
+                fuse_log(FUSE_LOG_DEBUG, "%s: Virtiofsd received an event for"
+                         "mask %lld:0x%x and len %lld and current_offset %lld\n", __func__, metadata->mask,
+                         metadata->mask, metadata->event_len, event_offset);
+
+                fid = ((struct fanotify_event_info_fid *)( ((char *)metadata) + event_offset));
+                f_handle = (struct file_handle *) fid->handle;
+                records++;
+
+                if (metadata->vers != FANOTIFY_METADATA_VERSION) {
+                    fuse_log(FUSE_LOG_ERR, "%s: Fanotify metadata mismatch\n",
+                            __func__);
+                    goto unlock;
+                }
+
+                if (fid->hdr.info_type == FAN_EVENT_INFO_TYPE_FID ||
+                    fid->hdr.info_type == FAN_EVENT_INFO_TYPE_DFID) {
+                    event_offset += sizeof(struct fanotify_event_info_fid) +
+                                    sizeof(f_handle) + f_handle->handle_bytes;
+                    if (event_offset % 4 != 0){
+                        event_offset = (event_offset / 4) * 4 + 4;
+                    }
+                } else if (fid->hdr.info_type == FAN_EVENT_INFO_TYPE_DFID_NAME) {
+                    file_name = (char *)(f_handle->f_handle +
+                                f_handle->handle_bytes);
+                    name_len = strlen(file_name);
+                    event_offset += sizeof(struct fanotify_event_info_fid) +
+                                    sizeof(f_handle) + f_handle->handle_bytes +
+                                    name_len + 1;
+                    if (event_offset % 4 != 0){
+                         event_offset = (event_offset / 4) * 4 + 4;
+                    }
+                } else {
+                    send_event = false;
+                    break;
+                }
+
+                send_event = true;
+                fh_key = get_key(f_handle);
+
+                /*
+                 * First find the inode the event corresponds to. If the inode
+                 * does not exist it means it was deleted while we were reading
+                 * the event so do not create a notification
+                 */
+                inode_info = g_hash_table_lookup(se->fsnotify->fh_to_inode, fh_key);
+                g_free(fh_key->f_handle);
+                g_free(fh_key);
+
+                if (!inode_info) {
+                    continue;
+                }
+
+                /*
+                 * Now check if the inode is a parent inode or a child inode.
+                 * This is easy by checking if the record has a name.
+                 * If yes then it is a parent inode
+                 */
+                if (records == 1) {
+                    nodeid = inode_info->nodeid;
+                    generation = inode_info->generation;
+                    mask = metadata->mask;
+                } else if (records == 2) {
+                    notify_parent = true;
+                    parentid = nodeid;
+                    nodeid = inode_info->nodeid;
+                    generation = inode_info->generation;
+                    mask = metadata->mask | FAN_EVENT_ON_CHILD;
+                }
+            }
+            /* Something went bad so don't send the event */
+            if (!send_event) {
+                break;
+            }
+            fuse_log(FUSE_LOG_DEBUG, "%s: Sending event for"
+                     "inode %d parent inode %d and mask %lld:0x%x %lld\n",
+                     __func__, nodeid, parentid, metadata->mask,
+                     metadata->mask);
+            /* Everything is good so far so send the event to the guest */
+            fuse_lowlevel_notify_fsnotify(se, name_len, file_name,
+                                        mask,
+                                        notify_parent, parentid,
+                                        nodeid, generation);
+        }
+        pthread_mutex_unlock(&se->fsnotify->fs_lock);
+    }
+
+unlock:
+    pthread_mutex_unlock(&se->fsnotify->fs_lock);
+}
+
+static void lo_fsnotify_thread_exit(struct fuse_session *se)
+{
+    pthread_mutex_lock(&se->fsnotify->fs_lock);
+    close(se->fsnotify->epoll_fd);
+    /* Destroy the hash tables and the list related to fsnotify */
+    g_hash_table_remove_all(se->fsnotify->fsnotify_fds);
+    g_hash_table_remove_all(se->fsnotify->fh_to_inode);
+    g_slist_free(g_steal_pointer(&se->fsnotify->fsnotify_fd_list));
+    se->fsnotify->thread_running = 0;
+    pthread_mutex_unlock(&se->fsnotify->fs_lock);
+
+}
+
+static int lo_fsnotify_cleanup(struct fuse_session *se)
+{
+    int ret;
+
+    pthread_mutex_lock(&se->fsnotify->fs_lock);
+    ret = se->fsnotify->cleanup_fsnotify;
+    pthread_mutex_unlock(&se->fsnotify->fs_lock);
+
+    return ret;
+}
+
+/*
+ * Function for the thread that monitors the fsnotify (fanotify) events. For
+ * this instance epoll is used to monitor the dynamically created/destroyed
+ * fsnotify fds for incoming events
+ */
+static void *lo_fsnotify_event(void *session)
+{
+    struct fuse_session *se = (struct fuse_session *)session;
+    struct fuse_fsnotify_fd *fsnotify_fd;
+    struct epoll_event events[MAX_EPOLL_EVENTS];
+    int event_num, i;
+    GSList *iter;
+
+    /* Create the epoll instance */
+    se->fsnotify->epoll_fd = epoll_create1(0);
+    if (se->fsnotify->epoll_fd == -1) {
+        fuse_log(FUSE_LOG_ERR, "%s: Failed to create an epoll instance\n",
+                 __func__);
+        return NULL;
+    }
+
+    fuse_log(FUSE_LOG_DEBUG, "%s: Created the epoll_fd:%d\n", __func__,
+             se->fsnotify->epoll_fd);
+
+    /* Mark the thread as running */
+    se->fsnotify->thread_running = 1;
+
+    for (;;) {
+        /* Check if we are exiting/cleaning up */
+        if (lo_fsnotify_cleanup(se)) {
+            break;
+        }
+        /* No fsnotify instances created yet */
+        if (se->fsnotify->fsnotify_fd_list == NULL) {
+            continue;
+        }
+
+        /* Refresh the fsnotify fds monitored with epoll */
+        pthread_mutex_lock(&se->fsnotify->fs_lock);
+        for (iter = se->fsnotify->fsnotify_fd_list; iter != NULL &&
+             !se->fsnotify->cleanup_fsnotify; iter = iter->next) {
+
+            struct epoll_event event;
+            fsnotify_fd = (struct fuse_fsnotify_fd *)iter->data;
+
+            event.events = EPOLLIN | EPOLLET;
+            event.data.fd = fsnotify_fd->fd;
+            /* Also add the fd to the epoll instance */
+            epoll_ctl(se->fsnotify->epoll_fd, EPOLL_CTL_ADD, fsnotify_fd->fd,
+                      &event);
+        }
+        pthread_mutex_unlock(&se->fsnotify->fs_lock);
+
+        /* Poll the fsnotify fds for events */
+        event_num = epoll_wait(se->fsnotify->epoll_fd, events,
+                               MAX_EPOLL_EVENTS, 0);
+        if (event_num <= 0){
+            continue;
+        }
+        /* Got events so now process them */
+        for (i = 0; i < event_num; i++) {
+             lo_handle_events(se, events[i].data.fd);
+        }
+    }
+    /*
+     * The fsnotify thread is ready to exit so cleanup everything and mark
+     * the thread as not active
+     */
+    lo_fsnotify_thread_exit(se);
+    return NULL;
+}
+
 static void lo_init(void *userdata, struct fuse_conn_info *conn)
 {
     struct lo_data *lo = (struct lo_data *)userdata;
@@ -807,6 +1058,16 @@ static void lo_init(void *userdata, struct fuse_conn_info *conn)
         } else {
             fuse_log(FUSE_LOG_DEBUG, "lo_init: disabling posix locks\n");
             conn->want &= ~FUSE_CAP_POSIX_LOCKS;
+        }
+    }
+
+    if (conn->capable & FUSE_CAP_FSNOTIFY_SUPPORT) {
+        if (lo->fsnotify) {
+            fuse_log(FUSE_LOG_DEBUG, "lo_init: activating fsnotify support\n");
+            conn->want |= FUSE_CAP_FSNOTIFY_SUPPORT;
+        } else {
+            fuse_log(FUSE_LOG_DEBUG, "lo_init: disabling fsnotify support\n");
+            conn->want &= ~FUSE_CAP_FSNOTIFY_SUPPORT;
         }
     }
 
@@ -4539,6 +4800,7 @@ int main(int argc, char *argv[])
         .user_killpriv_v2 = -1,
         .user_posix_acl = -1,
         .user_security_label = -1,
+        .fsnotify = 0,
     };
     struct lo_map_elem *root_elem;
     struct lo_map_elem *reserve_elem;
@@ -4680,6 +4942,19 @@ int main(int argc, char *argv[])
     se = fuse_session_new(&args, &lo_oper, sizeof(lo_oper), &lo);
     if (se == NULL) {
         goto err_out1;
+    }
+
+    /* If fsnotify is supported initialize its data */
+    if (lo.fsnotify){
+        fuse_fsnotify_init(se);
+        /* Kick the fsnotify thread */
+        if (pthread_create(&se->fsnotify->fs_thread, NULL,
+                           lo_fsnotify_event, se)) {
+            fuse_log(FUSE_LOG_ERR, "Can't create the fsnotify thread\n");
+            goto err_out1;
+        }
+        /* Detach the fsnotify thread since it is not bound to a virtqueue */
+        pthread_detach(se->fsnotify->fs_thread);
     }
 
     if (fuse_set_signal_handlers(se) != 0) {
