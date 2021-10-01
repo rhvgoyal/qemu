@@ -787,7 +787,205 @@ static struct file_handle *get_f_handle(char *pathname)
 }
 
 /*
- * Function to handle the fsnotify events generated. If the event read is valid
+ * The lock to the session is already held when calling this function thus
+ * it is safe to create the fsnotify instance and add it to the hash tables
+ */
+static struct fuse_fsnotify_fd *lo_fsnotify_init(void *session,
+                                                 uint64_t instance_id)
+{
+    struct fuse_session *se = (struct fuse_session *)session;
+    struct fuse_fsnotify_fd *fsnotify_fd;
+
+    /* Create a new fsnotify (fanotify) instance */
+    fsnotify_fd = g_new0(struct fuse_fsnotify_fd, 1);
+    fsnotify_fd->fd = fanotify_init(FAN_CLASS_NOTIF | FAN_NONBLOCK |
+                                   FAN_REPORT_DFID_NAME | FAN_REPORT_FID, 0);
+
+    if (fsnotify_fd->fd == -1) {
+        fuse_log(FUSE_LOG_ERR, "%s: Fsnotify instance not created", __func__);
+        g_free(fsnotify_fd);
+        return NULL;
+    }
+
+    fuse_log(FUSE_LOG_DEBUG, "%s: Created fsnotify instance %d\n",
+             __func__, fsnotify_fd->fd);
+
+    /*
+     * Insert the new fsnotify fd to the hash table of fds
+     * to have a mapping between the user space inotify/fanotify fd and the
+     * fuse fsnotify fd.
+     * The instance_id is here for future implementations and serves as an id
+     * for the different fsnotify (inotify/fanotify) instances we create. For
+     * now it will be 0.
+     */
+    g_hash_table_insert(se->fsnotify->fsnotify_fds, GUINT_TO_POINTER(instance_id),
+                        fsnotify_fd);
+
+    /*
+     * Add the fd to the list of active fsnotify fds so we can poll it for
+     * events. This list is also added for future implementations.
+     */
+    se->fsnotify->fsnotify_fd_list = g_slist_append(se->fsnotify->fsnotify_fd_list,
+                                          fsnotify_fd);
+
+    return fsnotify_fd;
+}
+
+static void lo_fsnotify(fuse_req_t req, fuse_ino_t ino, uint64_t mask)
+{
+    struct fuse_session *se = req->se;
+    struct fuse_fsnotify_fd *fsnotify_fd = NULL;
+    struct lo_data *lo;
+    struct lo_inode *inode;
+    char procname[64];
+    char linkname[256];
+    int ret = 0;
+    /*int *wd_exists;*/
+    uint64_t fsnotify_id = 0;
+
+    if (mask && !(mask & FUSE_FSNOTIFY_SUPPORTED)) {
+        fuse_log(FUSE_LOG_ERR, "%s: Fsnotify event not supported\n", __func__);
+        errno = -EINVAL;
+        goto out;
+    }
+
+    fuse_log(FUSE_LOG_DEBUG, "%s: Got a request for inode %llu and mask %llu:0x%x\n", __func__, ino, mask, mask);
+    pthread_mutex_lock(&se->fsnotify->fs_lock);
+
+    /* First search the hash table for the fsnotify instance */
+    fsnotify_fd = g_hash_table_lookup(se->fsnotify->fsnotify_fds,
+                                     GUINT_TO_POINTER(fsnotify_id));
+    /*
+     * No previous fsnotify instance for the fsnotify identifier exists so
+     * create it
+     */
+    if (!fsnotify_fd) {
+        fsnotify_fd = lo_fsnotify_init(se, fsnotify_id);
+        if (!fsnotify_fd) {
+            errno = -EBADF;
+            goto out;
+        }
+    }
+
+    /* Get the inode on which we are going to add/remove the watch on/from */
+    inode = lo_inode(req, ino);
+    if (!inode) {
+        fuse_log(FUSE_LOG_DEBUG, "%s: Inode %llu is NULL\n", __func__, ino);
+        errno = -ENOENT;
+        goto out;
+    }
+
+    /*
+     * Since we need the name of the file/dir as an argument to the
+     * fanotify_mark system call, we need to get a name that
+     * corresponds to the inode. So use readlinkat
+     */
+    lo = lo_data(req);
+    snprintf(procname, 64, "%i", inode->fd);
+    ret = readlinkat(lo->proc_self_fd, procname, linkname, 256);
+    if (ret < 0) {
+        fuse_log(FUSE_LOG_ERR, "%s: readlinkat failed for inode %llu\n",
+                 __func__, ino);
+        goto out;
+    }
+    linkname[ret] = '\0';
+
+    /* mask 0: delete watch, mask != 0: modify watch */
+    switch (mask) {
+        /* Remove the watch */
+        case 0:
+            ret = fanotify_mark(fsnotify_fd->fd, FAN_MARK_REMOVE,
+                                inode->aggr_mask ^ (uint32_t) mask, AT_FDCWD,
+                                linkname);
+            if (ret < 0) {
+                fuse_log(FUSE_LOG_ERR, "%s: Failed to remove mark"
+                         " from file %s\n", __func__, linkname);
+                /*
+                 * Ignore the error for now. Probably it means that the kernel
+                 * deleted the watches on the inode prior to us so no need to
+                 * do anything than clean the hashtables for the mappings
+                 */
+            }
+            if (!mask) {
+                inode->aggr_mask = 0;
+            } else {
+                inode->aggr_mask &= inode->aggr_mask ^ (uint32_t) mask;
+            }
+
+            /* Reduce the refcount of the fsnotify intstance */
+            if (fsnotify_fd->refcount > 0) {
+                fsnotify_fd->refcount--;
+            }
+            fuse_log(FUSE_LOG_DEBUG, "%s: Decreasing fsnotify_fd refcount by 1: %d\n",
+                     __func__, fsnotify_fd->refcount);
+            break;
+        default:
+            /* First try to remove the excess bits from the aggregated watch */
+            ret = fanotify_mark(fsnotify_fd->fd, FAN_MARK_REMOVE,
+                                inode->aggr_mask ^ (uint32_t) mask,
+                                AT_FDCWD, linkname);
+            if (ret < 0) {
+                fuse_log(FUSE_LOG_ERR, "%s: Failed to remove mask %lu"
+                         " from file %s\n", __func__,
+                         inode->aggr_mask ^ (uint32_t) mask, linkname);
+            }
+            /* Now try to add the new bits to the aggregated watch */
+            ret = fanotify_mark(fsnotify_fd->fd, FAN_MARK_ADD, mask |
+                                FAN_EVENT_ON_CHILD | FAN_ONDIR, AT_FDCWD,
+                                linkname);
+            if (ret < 0) {
+                 fuse_log(FUSE_LOG_ERR, "%s: Failed to add watch"
+                          " descriptor on inode %lu\n", __func__, ino);
+                goto out;
+            }
+
+            /*
+             * If the new mask is bigger (more bits) than the old mask then
+             * increase the refcount, else decrease it
+             */
+            if (inode->aggr_mask <= mask)
+                fsnotify_fd->refcount++;
+            else if (inode->aggr_mask > mask) {
+                if (fsnotify_fd->refcount > 0)
+                    fsnotify_fd->refcount--;
+            }
+            fuse_log(FUSE_LOG_DEBUG, "%s: Increasing fsnotify_fd refcount by 1: %d\n",
+                     __func__, fsnotify_fd->refcount);
+            inode->aggr_mask = (uint32_t) mask;
+            goto out;
+    }
+out:
+    /*
+     * In this case the fsnotify instance does not have any watches attached
+     * to it so it is safe to remove it. If a new watch is placed on the
+     * same fsnotify instance in the guest afterwards, then a new fsnotify_fd
+     * will be created on virtiofsd
+     */
+    if (fsnotify_fd->refcount == 0) {
+        fuse_log(FUSE_LOG_DEBUG, "%s: Deleting fsnotify->fd %d\n",
+                 __func__, fsnotify_fd->fd);
+        /* Also remove all the watches/marks associated with this instance */
+        ret = fanotify_mark(fsnotify_fd->fd, FAN_MARK_FLUSH, mask, AT_FDCWD,
+                            linkname);
+        if (ret < 0) {
+            fuse_log(FUSE_LOG_ERR, "%s: Failed to remove marks from fanotify"
+                        " \n", __func__);
+        }
+        g_hash_table_remove(se->fsnotify->fsnotify_fds,
+                            GUINT_TO_POINTER(fsnotify_id));
+        se->fsnotify->fsnotify_fd_list = \
+                                g_slist_remove(se->fsnotify->fsnotify_fd_list,
+                                               fsnotify_fd);
+        close(fsnotify_fd->fd);
+    }
+
+    lo_inode_put(lo, &inode);
+    pthread_mutex_unlock(&se->fsnotify->fs_lock);
+    fuse_reply_err(req, ret < 0 ? errno : 0);
+}
+
+/*
+ * Function to handle the inotify events generated. If the event read is valid
  * send it to the guest through the notification queue
  */
 static void lo_handle_events(struct fuse_session *se, int fd)
@@ -4257,6 +4455,7 @@ static struct fuse_lowlevel_ops lo_oper = {
     .lseek = lo_lseek,
     .syncfs = lo_syncfs,
     .destroy = lo_destroy,
+    .fsnotify = lo_fsnotify,
 };
 
 /* Print vhost-user.json backend program capabilities */
