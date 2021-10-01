@@ -122,6 +122,15 @@ static const int syscall_allowlist[] = {
     SCMP_SYS(umask),
     SCMP_SYS(nanosleep),
     SCMP_SYS(clock_nanosleep),
+    SCMP_SYS(inotify_init1),
+    SCMP_SYS(inotify_add_watch),
+    SCMP_SYS(inotify_rm_watch),
+    SCMP_SYS(epoll_create1),
+    SCMP_SYS(epoll_ctl),
+    SCMP_SYS(epoll_wait),
+    SCMP_SYS(fanotify_init),
+    SCMP_SYS(fanotify_mark),
+    SCMP_SYS(name_to_handle_at),
 };
 
 /* Syscalls used when --syslog is enabled */
