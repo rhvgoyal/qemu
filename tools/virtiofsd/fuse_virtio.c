@@ -861,6 +861,7 @@ static void fv_queue_cleanup_thread(struct fv_VuDev *vud, int qidx)
     int ret;
     struct fv_QueueInfo *ourqi;
     struct fuse_session *se = vud->se;
+    int running = 0;
 
     assert(qidx < vud->nqueues);
     ourqi = vud->qi[qidx];
@@ -882,6 +883,20 @@ static void fv_queue_cleanup_thread(struct fv_VuDev *vud, int qidx)
                      " %d\n", __func__, qidx, ret);
         }
         close(ourqi->kill_fd);
+    } else if (se->notify_enabled && se->fsnotify && (qidx == 0)) {
+        /* Signal the fsnotify thread to cleanup and exit */
+        pthread_mutex_lock(&se->fsnotify->fs_lock);
+        se->fsnotify->cleanup_fsnotify = 1;
+        pthread_mutex_unlock(&se->fsnotify->fs_lock);
+        /* Wait for the fsnotify thread to exit safely */
+        while (1) {
+            pthread_mutex_lock(&se->fsnotify->fs_lock);
+            running = se->fsnotify->thread_running;
+            pthread_mutex_unlock(&se->fsnotify->fs_lock);
+            if (!running) {
+                break;
+            }
+        }
     }
     pthread_mutex_destroy(&ourqi->vq_lock);
     ourqi->kick_fd = -1;
