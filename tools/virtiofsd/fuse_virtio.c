@@ -1016,7 +1016,7 @@ static uint64_t fv_get_protocol_features(VuDev *dev)
 static int fv_get_config(VuDev *dev, uint8_t *config, uint32_t len)
 {
     struct virtio_fs_config fscfg = {};
-    unsigned notify_size, roundto = 64;
+    unsigned notify_size, roundto = 512;
     union fuse_notify_union {
         struct fuse_notify_poll_wakeup_out  wakeup_out;
         struct fuse_notify_inval_inode_out  inode_out;
@@ -1025,6 +1025,7 @@ static int fv_get_config(VuDev *dev, uint8_t *config, uint32_t len)
         struct fuse_notify_store_out        store_out;
         struct fuse_notify_retrieve_out     retrieve_out;
         struct fuse_notify_lock_out         lock_out;
+        struct fuse_notify_fsnotify_out     fsnotify_out;
     };
 
     notify_size = sizeof(struct fuse_out_header) +
