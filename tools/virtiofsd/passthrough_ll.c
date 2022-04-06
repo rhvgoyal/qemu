@@ -118,6 +118,8 @@ struct lo_inode {
     GHashTable *posix_locks; /* protected by lo_inode->plock_mutex */
 
     mode_t filetype;
+    struct file_handle *f_handle; /* The file handle for this object */
+    uint32_t aggr_mask;
 };
 
 struct lo_cred {
