@@ -716,6 +716,34 @@ static int lo_inode_open(struct lo_data *lo, struct lo_inode *inode,
     return fd;
 }
 
+/* Helper to get file handle for an inode/file */
+static struct file_handle *get_f_handle(char *pathname)
+{
+    struct file_handle *f_handle;
+    const int dirfd = AT_FDCWD;
+    int mnt_id, ret, handle_size = 0;
+
+    /* Allocate memory for the file_handle */;
+    f_handle = g_malloc0(sizeof(struct file_handle) +
+                         MAX_HANDLE_SZ);
+
+    f_handle->handle_bytes = handle_size;
+    ret = name_to_handle_at(dirfd, pathname, f_handle, &mnt_id, 0);
+    if (ret < 0) {
+        handle_size = f_handle->handle_bytes;
+        g_free(f_handle);
+        f_handle = g_malloc0(sizeof(struct file_handle) + handle_size);
+        f_handle->handle_bytes = handle_size;
+           //fuse_log(FUSE_LOG_ERR, "%s: name_to_handle_at failed\n", __func__);
+        ret = name_to_handle_at(dirfd, pathname, f_handle, &mnt_id, 0);
+        if (ret < 0) {
+            perror("name_to_handle_at");
+               return NULL;
+        }
+    }
+    return f_handle;
+}
+
 static void lo_init(void *userdata, struct fuse_conn_info *conn)
 {
     struct lo_data *lo = (struct lo_data *)userdata;
@@ -1104,8 +1132,14 @@ static int lo_do_lookup(fuse_req_t req, fuse_ino_t parent, const char *name,
     int saverr;
     uint64_t mnt_id;
     struct lo_data *lo = lo_data(req);
+    struct fuse_session *se = req->se;
     struct lo_inode *inode = NULL;
     struct lo_inode *dir = lo_inode(req, parent);
+    struct file_handle *inode_f_handle;
+    struct fsnotify_fh_key *inode_key = NULL;
+    struct fuse_inode_info *inode_exists;
+    char procname[64];
+    char linkname[256];
 
     if (inodep) {
         *inodep = NULL; /* in case there is an error */
@@ -1168,6 +1202,8 @@ static int lo_do_lookup(fuse_req_t req, fuse_ino_t parent, const char *name,
         inode->key.ino = e->attr.st_ino;
         inode->key.dev = e->attr.st_dev;
         inode->key.mnt_id = mnt_id;
+        inode->f_handle = NULL;
+        inode->aggr_mask = 0;
         if (lo->posix_lock) {
             pthread_mutex_init(&inode->plock_mutex, NULL);
             inode->posix_locks = g_hash_table_new_full(
@@ -1180,6 +1216,53 @@ static int lo_do_lookup(fuse_req_t req, fuse_ino_t parent, const char *name,
     }
     e->ino = inode->fuse_ino;
 
+    if (lo->fsnotify) {
+        snprintf(procname, 64, "%i", inode->fd);
+        res = readlinkat(lo->proc_self_fd, procname, linkname, 256);
+        if (res < 0) {
+            fuse_log(FUSE_LOG_ERR, "%s: readlinkat for inode %llu failed\n",
+                     __func__, inode->fuse_ino);
+            goto out;
+        }
+        linkname[res] = '\0';
+
+        /* Get the file handle for the target inode */
+        inode_f_handle = get_f_handle(linkname);
+
+        /*Key to for file handle to inode mapping */
+        inode_key = get_key(inode_f_handle);
+
+        pthread_mutex_lock(&se->fsnotify->fs_lock);
+        /*
+         * Checking if the f_handle is already mapped to the inode. If yes
+         * there is not point in adding it again to the hash table
+         */
+        inode_exists = g_hash_table_lookup(se->fsnotify->fh_to_inode,
+                                           inode_key);
+        if (inode_exists) {
+            res = 0;
+            fuse_log(FUSE_LOG_DEBUG, "%s: The file_handle mapping for"
+                " inode: %lld already exists\n", __func__,
+                inode_exists->nodeid);
+            g_free(inode_key->f_handle);
+            g_free(inode_key);
+            pthread_mutex_unlock(&se->fsnotify->fs_lock);
+            goto out;
+        }
+        inode->f_handle = inode_f_handle;
+        inode_exists = g_new0(struct fuse_inode_info, 1);
+        inode_exists->nodeid = inode->fuse_ino;
+        inode_exists->generation = e->generation;
+
+        /*
+         * Add a map from the file handle to the inode. This will be used to
+         * quickly find which handle corresponds to which inode.
+         */
+        g_hash_table_insert(se->fsnotify->fh_to_inode, inode_key, inode_exists);
+        pthread_mutex_unlock(&se->fsnotify->fs_lock);
+    }
+
+out:
     /* Transfer ownership of inode pointer to caller or drop it */
     if (inodep) {
         *inodep = inode;
@@ -1771,6 +1854,7 @@ static void unref_inode_lolocked(struct lo_data *lo, struct lo_inode *inode,
 static void lo_forget_one(fuse_req_t req, fuse_ino_t ino, uint64_t nlookup)
 {
     struct lo_data *lo = lo_data(req);
+    struct fuse_session *se = req->se;
     struct lo_inode *inode;
 
     inode = lo_inode(req, ino);
@@ -1781,6 +1865,13 @@ static void lo_forget_one(fuse_req_t req, fuse_ino_t ino, uint64_t nlookup)
     fuse_log(FUSE_LOG_DEBUG, "  forget %lli %lli -%lli\n",
              (unsigned long long)ino, (unsigned long long)inode->nlookup,
              (unsigned long long)nlookup);
+
+    if (lo->fsnotify) {
+        pthread_mutex_lock(&se->fsnotify->fs_lock);
+        /* Now try to remove the keys/values from the hashtables */
+        cleanup_hashtables(se, inode->f_handle);
+        pthread_mutex_unlock(&se->fsnotify->fs_lock);
+    }
 
     unref_inode_lolocked(lo, inode, nlookup);
     lo_inode_put(lo, &inode);
