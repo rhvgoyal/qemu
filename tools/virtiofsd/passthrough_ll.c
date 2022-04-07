@@ -716,6 +716,40 @@ static int lo_inode_open(struct lo_data *lo, struct lo_inode *inode,
     return fd;
 }
 
+/* Helper to get the hashtable key */
+static struct fsnotify_fh_key *get_key(struct file_handle *f_handle)
+{
+    struct fsnotify_fh_key *fh_key = NULL;
+
+    fh_key = g_new0(struct fsnotify_fh_key, 1);
+    fh_key->f_handle = g_malloc0(sizeof(struct file_handle) +
+                                 f_handle->handle_bytes);
+    fh_key->f_handle->handle_bytes = f_handle->handle_bytes;
+    fh_key->f_handle->handle_type = f_handle->handle_type;
+    strncpy((char*) fh_key->f_handle->f_handle, (char*) f_handle->f_handle,
+            f_handle->handle_bytes);
+
+    return fh_key;
+}
+
+static void cleanup_hashtables(struct fuse_session *se,
+                               struct file_handle *f_handle)
+{
+    gpointer *orig_key = NULL, *value = NULL;
+    struct fsnotify_fh_key *fh_key;
+
+    if (!f_handle)
+        return;
+
+    fh_key = get_key(f_handle);
+    if (g_hash_table_lookup_extended(se->fsnotify->fh_to_inode, fh_key,
+                                     orig_key, value)) {
+        g_hash_table_remove(se->fsnotify->fh_to_inode, fh_key);
+    }
+    g_free(fh_key->f_handle);
+    g_free(fh_key);
+}
+
 /* Helper to get file handle for an inode/file */
 static struct file_handle *get_f_handle(char *pathname)
 {
